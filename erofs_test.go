@@ -58,6 +58,17 @@ func TestBasic(t *testing.T) {
 				"user.xdg.comment": "comment for f4",
 				"user.common":      "same-value",
 			})
+			// Value is defined in /usr/lib/generated/generate.sh of testdata
+			longPrefix := "user.long.prefix.vfvzyrvujoemkjztekxczhyyqpzncyav.xiksvigqpjttnvcvxgaxpnrghppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwd."
+			longValue := "value1-ppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwdqfgvgkrgdwcegjpfmelrejllrjkpbwindlfynuzjgvcgygyayjvmtxgsbjkzrydoswbsknrrwjkwzxhasowuzdoxlhbxso"
+			checkXattrs(t, efs, "/usr/lib/generated/xattrs/long-prefix-xattrs", map[string]string{
+				longPrefix + "long-value": longValue,
+				longPrefix + "shortvalue": "y",
+			})
+			checkXattrs(t, efs, "/usr/lib/generated/xattrs/short-prefix-xattrs", map[string]string{
+				"user.short.long-value": longValue,
+				"user.short.shortvalue": "y",
+			})
 			checkDevice(t, efs, "/dev/block0", fs.ModeDevice, 0x00000101)
 			checkDevice(t, efs, "/dev/block1", fs.ModeDevice, 0)
 			checkDevice(t, efs, "/dev/char0", fs.ModeCharDevice, 0x00000202)
