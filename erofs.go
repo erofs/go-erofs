@@ -84,12 +84,138 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 type image struct {
 	sb disk.SuperBlock
 
-	meta    io.ReaderAt
-	blkPool sync.Pool
+	meta         io.ReaderAt
+	blkPool      sync.Pool
+	longPrefixes []string // cached long xattr prefixes
+	prefixesOnce sync.Once
+	prefixesErr  error
 }
 
 func (img *image) blkOffset() int64 {
 	return int64(img.sb.MetaBlkAddr) << int64(img.sb.BlkSizeBits)
+}
+
+// loadLongPrefixes loads and caches the long xattr prefixes from the superblock
+func (img *image) loadLongPrefixes() error {
+	img.prefixesOnce.Do(func() {
+		if img.sb.XattrPrefixCount == 0 {
+			return
+		}
+
+		// Long prefixes are stored in the packed inode, after the inode header
+		// The packed inode is typically a compact inode (32 bytes)
+		// Address = MetaBlkAddr + (PackedNid * 32) + inode_size + (XattrPrefixStart * 4)
+		// Note: XattrPrefixStart is in units of 4 bytes from the end of the packed inode
+		baseAddr := img.blkOffset() + int64(img.sb.PackedNid)*32 + 32 + int64(img.sb.XattrPrefixStart)*4
+
+		img.longPrefixes = make([]string, img.sb.XattrPrefixCount)
+
+		// We'll read the prefixes incrementally since they can be large
+		// and may span multiple blocks
+		currentAddr := baseAddr
+		var blk *block
+		var buf []byte
+		var err error
+		bufOffset := 0 // offset within the current buffer
+
+		for i := 0; i < int(img.sb.XattrPrefixCount); i++ {
+			// Ensure we have at least 2 bytes to read the length
+			if blk == nil || bufOffset+2 > len(buf) {
+				if blk != nil {
+					img.putBlock(blk)
+				}
+				blk, err = img.loadAt(currentAddr, int64(1<<img.sb.BlkSizeBits))
+				if err != nil {
+					img.prefixesErr = fmt.Errorf("failed to load long xattr prefix data at index %d: %w", i, err)
+					return
+				}
+				buf = blk.bytes()
+				bufOffset = 0
+			}
+
+			// Read length (little endian uint16) - includes base_index byte + infix bytes
+			prefixLen := int(binary.LittleEndian.Uint16(buf[bufOffset : bufOffset+2]))
+			bufOffset += 2
+			currentAddr += 2
+
+			if prefixLen < 1 {
+				if blk != nil {
+					img.putBlock(blk)
+				}
+				img.prefixesErr = fmt.Errorf("invalid long xattr prefix length %d at index %d", prefixLen, i)
+				return
+			}
+
+			// Check if we have enough data for the prefix in current buffer
+			if bufOffset+prefixLen > len(buf) {
+				// Need to read more data - reload from current position
+				if blk != nil {
+					img.putBlock(blk)
+				}
+				// Load enough to cover this prefix
+				loadSize := int64(prefixLen)
+				if loadSize < int64(1<<img.sb.BlkSizeBits) {
+					loadSize = int64(1 << img.sb.BlkSizeBits)
+				}
+				blk, err = img.loadAt(currentAddr, loadSize)
+				if err != nil {
+					img.prefixesErr = fmt.Errorf("failed to load long xattr prefix data for index %d: %w", i, err)
+					return
+				}
+				buf = blk.bytes()
+				bufOffset = 0
+
+				// Verify we have enough now
+				if prefixLen > len(buf) {
+					img.putBlock(blk)
+					img.prefixesErr = fmt.Errorf("long xattr prefix at index %d too large (%d bytes)", i, prefixLen)
+					return
+				}
+			}
+
+			// First byte is the base_index
+			baseIndex := xattrIndex(buf[bufOffset])
+			bufOffset++
+			currentAddr++
+			prefixLen--
+
+			// Remaining bytes are the infix
+			infix := string(buf[bufOffset : bufOffset+prefixLen])
+			bufOffset += prefixLen
+			currentAddr += int64(prefixLen)
+
+			// Construct full prefix: base prefix + infix
+			img.longPrefixes[i] = baseIndex.String() + infix
+
+			// Align to 4-byte boundary
+			// Total length field (2 bytes) + data (base_index + infix)
+			totalLen := 2 + 1 + prefixLen
+			if rem := totalLen % 4; rem != 0 {
+				padding := 4 - rem
+				bufOffset += padding
+				currentAddr += int64(padding)
+			}
+		}
+
+		if blk != nil {
+			img.putBlock(blk)
+		}
+	})
+
+	return img.prefixesErr
+}
+
+// getLongPrefix returns the long xattr prefix at the given index
+func (img *image) getLongPrefix(index uint8) (string, error) {
+	if err := img.loadLongPrefixes(); err != nil {
+		return "", err
+	}
+
+	if int(index) >= len(img.longPrefixes) {
+		return "", fmt.Errorf("long xattr prefix index %d out of range (max %d)", index, len(img.longPrefixes)-1)
+	}
+
+	return img.longPrefixes[index], nil
 }
 
 func (img *image) loadAt(addr, size int64) (*block, error) {

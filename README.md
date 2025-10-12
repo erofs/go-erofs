@@ -14,7 +14,7 @@ could provide an interface to create erofs files as well.
 - [x] Read erofs files created with default `mkfs.erofs` options
 - [x] Read chunk-based erofs files (without indexes)
 - [x] Xattr support
-- [ ] Long xattr prefix support
+- [x] Long xattr prefix support
 - [ ] Read erofs files with compression
 - [ ] Extra devices for chunked data and chunk indexes
 - [ ] Creating erofs files
