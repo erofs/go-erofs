@@ -88,9 +88,13 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 		sb = sb[disk.SizeXattrEntry:]
 		var prefix string
 		if xattrEntry.NameIndex&0x80 == 0x80 {
-			//nameIndex := xattrEntry.NameIndex & 0x7F
-			// TODO: Get long prefix
-			return fmt.Errorf("shared xattr with long prefix not implemented for nid %d", b.inode)
+			// Long prefix: highest bit set
+			longPrefixIndex := xattrEntry.NameIndex & 0x7F
+			var err error
+			prefix, err = b.img.getLongPrefix(longPrefixIndex)
+			if err != nil {
+				return fmt.Errorf("failed to get long prefix for shared xattr nid %d: %w", b.inode, err)
+			}
 		} else if xattrEntry.NameIndex != 0 {
 			prefix = xattrIndex(xattrEntry.NameIndex).String()
 		}
@@ -130,9 +134,13 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 		xb = xb[disk.SizeXattrEntry:]
 		var prefix string
 		if xattrEntry.NameIndex&0x80 == 0x80 {
-			//nameIndex := xattrEntry.NameIndex & 0x7F
-			// TODO: Get long prefix
-			return fmt.Errorf("shared xattr with long prefix not implemented for nid %d", b.inode)
+			// Long prefix: highest bit set
+			longPrefixIndex := xattrEntry.NameIndex & 0x7F
+			var err error
+			prefix, err = b.img.getLongPrefix(longPrefixIndex)
+			if err != nil {
+				return fmt.Errorf("failed to get long prefix for inline xattr nid %d: %w", b.inode, err)
+			}
 		} else if xattrEntry.NameIndex != 0 {
 			prefix = xattrIndex(xattrEntry.NameIndex).String()
 		}
