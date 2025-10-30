@@ -56,7 +56,6 @@ type InodeCompact struct {
 	Size         uint32
 	Reserved     uint32
 	InodeData    uint32
-	RawBlockSize uint16
 	Inode        uint32
 	UID          uint16
 	GID          uint16
