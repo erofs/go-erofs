@@ -15,10 +15,15 @@ func TestBasic(t *testing.T) {
 		"default",
 		"chunk-4096",
 		"chunk-8192",
+		"chunk-index",
 		// TODO: Add compressed layout
 	} {
 		t.Run(name, func(t *testing.T) {
-			efs, err := EroFS(loadTestFile(t, "basic-"+name))
+			var opts []Opt
+			if name == "chunk-index" {
+				opts = append(opts, WithExtraDevices(loadTestFile(t, "basic-chunk-index-data")))
+			}
+			efs, err := EroFS(loadTestFile(t, "basic-"+name), opts...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -57,6 +62,17 @@ func TestBasic(t *testing.T) {
 			checkXattrs(t, efs, "/usr/lib/withxattr/f4", map[string]string{
 				"user.xdg.comment": "comment for f4",
 				"user.common":      "same-value",
+			})
+			// Value is defined in /usr/lib/generated/generate.sh of testdata
+			longPrefix := "user.long.prefix.vfvzyrvujoemkjztekxczhyyqpzncyav.xiksvigqpjttnvcvxgaxpnrghppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwd."
+			longValue := "value1-ppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwdqfgvgkrgdwcegjpfmelrejllrjkpbwindlfynuzjgvcgygyayjvmtxgsbjkzrydoswbsknrrwjkwzxhasowuzdoxlhbxso"
+			checkXattrs(t, efs, "/usr/lib/generated/xattrs/long-prefix-xattrs", map[string]string{
+				longPrefix + "long-value": longValue,
+				longPrefix + "shortvalue": "y",
+			})
+			checkXattrs(t, efs, "/usr/lib/generated/xattrs/short-prefix-xattrs", map[string]string{
+				"user.short.long-value": longValue,
+				"user.short.shortvalue": "y",
 			})
 			checkDevice(t, efs, "/dev/block0", fs.ModeDevice, 0x00000101)
 			checkDevice(t, efs, "/dev/block1", fs.ModeDevice, 0)

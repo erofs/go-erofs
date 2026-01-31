@@ -1,6 +1,7 @@
 package erofs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -47,11 +48,30 @@ type Stat struct {
 	Xattrs      map[string]string
 }
 
+type options struct {
+	extraDevices []io.ReaderAt
+}
+
+// Opt is an option for configuring the EroFS reader
+type Opt func(*options)
+
+// WithExtraDevices specifies additional devices to read
+// chunk data from
+func WithExtraDevices(devices ...io.ReaderAt) Opt {
+	return func(o *options) {
+		o.extraDevices = append(o.extraDevices, devices...)
+	}
+}
+
 // EroFS returns a FileSystem reading from the given readerat.
 // The readerat must be a valid erofs block file.
 // No additional memory mapping is done and must be handled by
 // the caller.
-func EroFS(r io.ReaderAt) (fs.FS, error) {
+func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
+	options := options{}
+	for _, opt := range opts {
+		opt(&options)
+	}
 	var superBlock [disk.SizeSuperBlock]byte
 	n, err := r.ReadAt(superBlock[:], disk.SuperBlockOffset)
 	if err != nil {
@@ -63,7 +83,8 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	}
 
 	i := image{
-		meta: r,
+		meta:         r,
+		extraDevices: options.extraDevices,
 	}
 	if err = decodeSuperBlock(superBlock, &i.sb); err != nil {
 		return nil, err
@@ -72,6 +93,26 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	if i.sb.BlkSizeBits < 9 || i.sb.BlkSizeBits > 24 {
 		return nil, fmt.Errorf("invalid super block: block size bits %d", i.sb.BlkSizeBits)
 	}
+	if int(i.sb.ExtraDevices) != len(options.extraDevices) {
+		// TODO: Provide options for skipping extra devices and error out later?
+		return nil, fmt.Errorf("invalid super block: extra devices count %d does not match provided %d", i.sb.ExtraDevices, len(options.extraDevices))
+	}
+	// Calculate device_id_mask
+	// sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
+	totalDevs := uint32(i.sb.ExtraDevices) + 1
+	if totalDevs == 0 {
+		i.deviceIdMask = 0
+	} else {
+		totalDevs--
+		totalDevs |= totalDevs >> 1
+		totalDevs |= totalDevs >> 2
+		totalDevs |= totalDevs >> 4
+		totalDevs |= totalDevs >> 8
+		totalDevs |= totalDevs >> 16
+		totalDevs++
+		i.deviceIdMask = uint16(totalDevs - 1)
+	}
+
 	i.blkPool.New = func() any {
 		return &block{
 			buf: make([]byte, 1<<i.sb.BlkSizeBits),
@@ -84,12 +125,140 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 type image struct {
 	sb disk.SuperBlock
 
-	meta    io.ReaderAt
-	blkPool sync.Pool
+	meta         io.ReaderAt
+	extraDevices []io.ReaderAt
+	deviceIdMask uint16
+	blkPool      sync.Pool
+	longPrefixes []string // cached long xattr prefixes
+	prefixesOnce sync.Once
+	prefixesErr  error
 }
 
 func (img *image) blkOffset() int64 {
 	return int64(img.sb.MetaBlkAddr) << int64(img.sb.BlkSizeBits)
+}
+
+// loadLongPrefixes loads and caches the long xattr prefixes from the superblock
+func (img *image) loadLongPrefixes() error {
+	img.prefixesOnce.Do(func() {
+		if img.sb.XattrPrefixCount == 0 {
+			return
+		}
+
+		// Long prefixes are stored in the packed inode, after the inode header
+		// The packed inode is typically a compact inode (32 bytes)
+		// Address = MetaBlkAddr + (PackedNid * 32) + inode_size + (XattrPrefixStart * 4)
+		// Note: XattrPrefixStart is in units of 4 bytes from the end of the packed inode
+		baseAddr := img.blkOffset() + int64(img.sb.PackedNid)*32 + 32 + int64(img.sb.XattrPrefixStart)*4
+
+		img.longPrefixes = make([]string, img.sb.XattrPrefixCount)
+
+		// We'll read the prefixes incrementally since they can be large
+		// and may span multiple blocks
+		currentAddr := baseAddr
+		var blk *block
+		var buf []byte
+		var err error
+		bufOffset := 0 // offset within the current buffer
+
+		for i := 0; i < int(img.sb.XattrPrefixCount); i++ {
+			// Ensure we have at least 2 bytes to read the length
+			if blk == nil || bufOffset+2 > len(buf) {
+				if blk != nil {
+					img.putBlock(blk)
+				}
+				blk, err = img.loadAt(currentAddr, int64(1<<img.sb.BlkSizeBits))
+				if err != nil {
+					img.prefixesErr = fmt.Errorf("failed to load long xattr prefix data at index %d: %w", i, err)
+					return
+				}
+				buf = blk.bytes()
+				bufOffset = 0
+			}
+
+			// Read length (little endian uint16) - includes base_index byte + infix bytes
+			prefixLen := int(binary.LittleEndian.Uint16(buf[bufOffset : bufOffset+2]))
+			bufOffset += 2
+			currentAddr += 2
+
+			if prefixLen < 1 {
+				if blk != nil {
+					img.putBlock(blk)
+				}
+				img.prefixesErr = fmt.Errorf("invalid long xattr prefix length %d at index %d", prefixLen, i)
+				return
+			}
+
+			// Check if we have enough data for the prefix in current buffer
+			if bufOffset+prefixLen > len(buf) {
+				// Need to read more data - reload from current position
+				if blk != nil {
+					img.putBlock(blk)
+				}
+				// Load enough to cover this prefix
+				loadSize := int64(prefixLen)
+				if loadSize < int64(1<<img.sb.BlkSizeBits) {
+					loadSize = int64(1 << img.sb.BlkSizeBits)
+				}
+				blk, err = img.loadAt(currentAddr, loadSize)
+				if err != nil {
+					img.prefixesErr = fmt.Errorf("failed to load long xattr prefix data for index %d: %w", i, err)
+					return
+				}
+				buf = blk.bytes()
+				bufOffset = 0
+
+				// Verify we have enough now
+				if prefixLen > len(buf) {
+					img.putBlock(blk)
+					img.prefixesErr = fmt.Errorf("long xattr prefix at index %d too large (%d bytes)", i, prefixLen)
+					return
+				}
+			}
+
+			// First byte is the base_index
+			baseIndex := xattrIndex(buf[bufOffset])
+			bufOffset++
+			currentAddr++
+			prefixLen--
+
+			// Remaining bytes are the infix
+			infix := string(buf[bufOffset : bufOffset+prefixLen])
+			bufOffset += prefixLen
+			currentAddr += int64(prefixLen)
+
+			// Construct full prefix: base prefix + infix
+			img.longPrefixes[i] = baseIndex.String() + infix
+
+			// Align to 4-byte boundary
+			// Total length field (2 bytes) + data (base_index + infix)
+			totalLen := 2 + 1 + prefixLen
+			if rem := totalLen % 4; rem != 0 {
+				padding := 4 - rem
+				bufOffset += padding
+				currentAddr += int64(padding)
+			}
+		}
+
+		if blk != nil {
+			img.putBlock(blk)
+		}
+	})
+
+	return img.prefixesErr
+}
+
+// getLongPrefix returns the long xattr prefix at the given index
+func (img *image) getLongPrefix(index uint8) (string, error) {
+	if err := img.loadLongPrefixes(); err != nil {
+		return "", err
+	}
+
+	if int(index) >= len(img.longPrefixes) {
+		return "", fmt.Errorf("long xattr prefix index %d out of range (max %d)", index, len(img.longPrefixes)-1)
+	}
+
+	return img.longPrefixes[index], nil
 }
 
 func (img *image) loadAt(addr, size int64) (*block, error) {
@@ -99,13 +268,17 @@ func (img *image) loadAt(addr, size int64) (*block, error) {
 	}
 
 	b := img.getBlock()
-	if n, err := img.meta.ReadAt(b.buf[:size], addr); err != nil {
-		img.putBlock(b)
-		return nil, fmt.Errorf("failed to read %d bytes at %d: %w", size, addr, err)
-	} else {
-		b.offset = 0
-		b.end = int32(n)
+	n, err := img.meta.ReadAt(b.buf[:size], addr)
+	if err != nil {
+		if err == io.EOF && n > 0 {
+			// Hit EOF but read some data
+		} else {
+			img.putBlock(b)
+			return nil, fmt.Errorf("failed to read %d bytes at %d: %w", size, addr, err)
+		}
 	}
+	b.offset = 0
+	b.end = int32(n)
 
 	return b, nil
 }
@@ -152,12 +325,10 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	case disk.LayoutChunkBased:
 		// first 2 le bytes for format, second 2 bytes are reserved
 		format := uint16(fi.inodeData)
-		if format&^(disk.LayoutChunkFormatBits|disk.LayoutChunkFormatIndexes) != 0 {
+		if format&^(disk.LayoutChunkFormatBits|disk.LayoutChunkFormatIndexes|disk.LayoutChunkFormat48Bit) != 0 {
 			return nil, fmt.Errorf("unsupported chunk format %x for nid %d: %w", format, fi.inode, ErrInvalid)
 		}
-		if format&disk.LayoutChunkFormatIndexes == disk.LayoutChunkFormatIndexes {
-			return nil, fmt.Errorf("chunk format with indexes for nid %d: %w", fi.inode, ErrNotImplemented)
-		}
+
 		chunkbits := img.sb.BlkSizeBits + uint8(format&disk.LayoutChunkFormatBits)
 		chunkn := int((fi.size-1)>>chunkbits) + 1
 		cn := int(pos >> chunkbits)
@@ -166,26 +337,66 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 			return nil, fmt.Errorf("chunk format does not fit into allocated bytes for nid %d: %w", fi.inode, ErrInvalid)
 		}
 
-		if fi.cached == nil {
-			// TODO: actually load it, why would it not be here though
-			return nil, errors.New("inode block not cached")
+		inodeStart := img.blkOffset() + int64(fi.inode*disk.SizeInodeCompact)
+		baseOffset := inodeStart + fi.dataOffset()
+
+		unit := int64(4)
+		if format&disk.LayoutChunkFormatIndexes == disk.LayoutChunkFormatIndexes {
+			unit = 8
+			// Align to 8 bytes
+			if baseOffset%8 != 0 {
+				baseOffset = (baseOffset + 7) & ^int64(7)
+			}
 		}
-		buf := fi.cached.bytes()
-		// TODO: Or support indexes
-		dataOffset := fi.dataOffset() + int64(cn*4)
-		if len(buf) < int(dataOffset)+4 {
-			return nil, fmt.Errorf("invalid chunk data for nid %d: %w", fi.inode, ErrInvalid)
+
+		entryPos := baseOffset + int64(cn)*unit
+		entryBuf := make([]byte, unit)
+		if _, err := img.meta.ReadAt(entryBuf, entryPos); err != nil {
+			return nil, fmt.Errorf("failed to read chunk entry at %d: %w", entryPos, err)
 		}
-		var rawAddr int32
-		if _, err := binary.Decode(buf[dataOffset:dataOffset+4], binary.LittleEndian, &rawAddr); err != nil {
-			return nil, err
+
+		var addr int64
+		var deviceID uint16
+
+		if unit == 8 {
+			var idx disk.InodeChunkIndex
+			if err := binary.Read(bytes.NewReader(entryBuf), binary.LittleEndian, &idx); err != nil {
+				return nil, err
+			}
+
+			var addrmask uint64
+			if format&disk.LayoutChunkFormat48Bit == disk.LayoutChunkFormat48Bit {
+				addrmask = (1 << 48) - 1
+			} else {
+				addrmask = (1 << 32) - 1
+			}
+
+			startblk := (uint64(idx.StartBlkHi) << 32) | uint64(idx.StartBlkLo)
+			startblk &= addrmask
+
+			if (startblk^0xFFFFFFFFFFFFFFFF)&addrmask == 0 {
+				addr = -1
+			} else {
+				addr = int64(startblk) << img.sb.BlkSizeBits
+				deviceID = idx.DeviceId & img.deviceIdMask
+			}
+		} else {
+			var rawAddr uint32
+			if err := binary.Read(bytes.NewReader(entryBuf), binary.LittleEndian, &rawAddr); err != nil {
+				return nil, err
+			}
+			if rawAddr == 0xFFFFFFFF {
+				addr = -1
+			} else {
+				addr = int64(rawAddr) << img.sb.BlkSizeBits
+			}
 		}
 
 		if bn == nblocks-1 {
 			blockEnd = int(fi.size - int64(bn)*int64(1<<img.sb.BlkSizeBits))
 		}
 
-		if rawAddr == -1 {
+		if addr == -1 {
 			// Null address, return new zero filled block
 			return &block{
 				buf: make([]byte, 1<<img.sb.BlkSizeBits),
@@ -194,11 +405,28 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		}
 
 		// Add block offset within chunk
-		if pos > 0 {
-			rawAddr += int32((pos - int64(cn<<chunkbits)) >> img.sb.BlkSizeBits)
+		blockPos := int64(bn) << img.sb.BlkSizeBits
+		if blockPos > 0 {
+			addr += (blockPos - int64(cn<<chunkbits))
 		}
 
-		addr = int64(rawAddr) << int64(img.sb.BlkSizeBits)
+		reader := img.meta
+		if deviceID > 0 {
+			if int(deviceID) > len(img.extraDevices) {
+				return nil, fmt.Errorf("invalid device id %d", deviceID)
+			}
+			reader = img.extraDevices[deviceID-1]
+		}
+
+		b := img.getBlock()
+		if n, err := reader.ReadAt(b.buf[blockOffset:blockEnd], addr); err != nil {
+			return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.inode, err)
+		} else if n != (blockEnd - blockOffset) {
+			return nil, fmt.Errorf("failed to read full block for nid %d: %w", fi.inode, ErrInvalid)
+		}
+		b.offset = int32(blockOffset)
+		b.end = int32(blockEnd)
+		return b, nil
 	case disk.LayoutCompressedFull, disk.LayoutCompressedCompact:
 		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.inode, ErrNotImplemented)
 	default:
