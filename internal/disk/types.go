@@ -19,6 +19,7 @@ const (
 
 	LayoutChunkFormatBits    = 0x001F
 	LayoutChunkFormatIndexes = 0x0020
+	LayoutChunkFormat48Bit   = 0x0040
 )
 
 type SuperBlock struct {
@@ -121,4 +122,10 @@ type XattrLongPrefixitem struct {
 type XattrLongPrefix struct {
 	BaseIndex uint8 // short xattr name prefix index
 	// Infix part after short prefix
+}
+
+type InodeChunkIndex struct {
+	StartBlkHi uint16
+	DeviceId   uint16
+	StartBlkLo uint32
 }
