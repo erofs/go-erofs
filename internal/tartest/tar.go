@@ -48,6 +48,19 @@ func TarAll(wt ...WriterToTar) WriterToTar {
 	})
 }
 
+// TarStream creates a WriterToTar which calls the provided
+// writers until the channel is closed.
+func TarStream(wc chan WriterToTar) WriterToTar {
+	return writerToFn(func(tw *tar.Writer) error {
+		for w := range wc {
+			if err := w.WriteTo(tw); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // TarFromWriterTo is used to create a tar stream from a tar record
 // creator. This can be used to manufacture more specific tar records
 // which allow testing specific tar cases which may be encountered

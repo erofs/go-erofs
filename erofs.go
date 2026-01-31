@@ -48,11 +48,30 @@ type Stat struct {
 	Xattrs      map[string]string
 }
 
+type options struct {
+	extraDevices []io.ReaderAt
+}
+
+// Opt is an option for configuring the EroFS reader
+type Opt func(*options)
+
+// WithExtraDevices specifies additional devices to read
+// chunk data from
+func WithExtraDevices(devices ...io.ReaderAt) Opt {
+	return func(o *options) {
+		o.extraDevices = append(o.extraDevices, devices...)
+	}
+}
+
 // EroFS returns a FileSystem reading from the given readerat.
 // The readerat must be a valid erofs block file.
 // No additional memory mapping is done and must be handled by
 // the caller.
-func EroFS(r io.ReaderAt) (fs.FS, error) {
+func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
+	o := options{}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	var superBlock [disk.SizeSuperBlock]byte
 	n, err := r.ReadAt(superBlock[:], disk.SuperBlockOffset)
 	if err != nil {
@@ -64,7 +83,8 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	}
 
 	i := image{
-		meta: r,
+		meta:         r,
+		extraDevices: o.extraDevices,
 	}
 	if err = decodeSuperBlock(superBlock, &i.sb); err != nil {
 		return nil, err
@@ -78,6 +98,13 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	if unknownFeat != 0 {
 		return nil, fmt.Errorf("unsupported incompatible feature 0x%x: %w", unknownFeat, ErrNotImplemented)
 	}
+	if int(i.sb.ExtraDevices) != len(o.extraDevices) {
+		// TODO: Provide options for skipping extra devices and error out later?
+		return nil, fmt.Errorf("invalid super block: extra devices count %d does not match provided %d", i.sb.ExtraDevices, len(o.extraDevices))
+	}
+	// Calculate device_id_mask
+	// sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
+	i.deviceIDMask = uint16(roundupPowerOfTwo(uint32(i.sb.ExtraDevices)+1) - 1)
 
 	i.blkPool.New = func() any {
 		return &block{
@@ -88,10 +115,24 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	return &i, nil
 }
 
+// roundupPowerOfTwo rounds v up to the next power of two.
+func roundupPowerOfTwo(v uint32) uint32 {
+	v--
+	v |= v >> 1
+	v |= v >> 2
+	v |= v >> 4
+	v |= v >> 8
+	v |= v >> 16
+	v++
+	return v
+}
+
 type image struct {
 	sb disk.SuperBlock
 
 	meta         io.ReaderAt
+	extraDevices []io.ReaderAt
+	deviceIDMask uint16
 	blkPool      sync.Pool
 	longPrefixes []string // cached long xattr prefixes
 	prefixesOnce sync.Once
@@ -284,12 +325,13 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	case disk.LayoutChunkBased:
 		// first 2 le bytes for format, second 2 bytes are reserved
 		format := uint16(fi.inodeData)
+		if format&disk.LayoutChunkFormat48Bit != 0 {
+			return nil, fmt.Errorf("48-bit chunk format for nid %d: %w", fi.nid, ErrNotImplemented)
+		}
 		if format&^(disk.LayoutChunkFormatBits|disk.LayoutChunkFormatIndexes) != 0 {
 			return nil, fmt.Errorf("unsupported chunk format %x for nid %d: %w", format, fi.nid, ErrInvalid)
 		}
-		if format&disk.LayoutChunkFormatIndexes == disk.LayoutChunkFormatIndexes {
-			return nil, fmt.Errorf("chunk format with indexes for nid %d: %w", fi.nid, ErrNotImplemented)
-		}
+
 		chunkbits := img.sb.BlkSizeBits + uint8(format&disk.LayoutChunkFormatBits)
 		chunkn := int((fi.size-1)>>chunkbits) + 1
 		cn := int(pos >> chunkbits)
@@ -298,19 +340,44 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 			return nil, fmt.Errorf("chunk format does not fit into allocated bytes for nid %d: %w", fi.nid, ErrInvalid)
 		}
 
-		if fi.cached == nil {
-			// TODO: actually load it, why would it not be here though
-			return nil, errors.New("inode block not cached")
+		inodeStart := img.metaStartPos() + int64(fi.nid*disk.SizeInodeCompact)
+		baseOffset := inodeStart + fi.flatDataOffset()
+
+		unit := 4
+		if format&disk.LayoutChunkFormatIndexes == disk.LayoutChunkFormatIndexes {
+			unit = 8
+			// Align to 8 bytes
+			if baseOffset%8 != 0 {
+				baseOffset = (baseOffset + 7) & ^int64(7)
+			}
 		}
-		buf := fi.cached.bytes()
-		// TODO: Or support indexes
-		dataOffset := fi.flatDataOffset() + int64(cn*4)
-		if len(buf) < int(dataOffset)+4 {
-			return nil, fmt.Errorf("invalid chunk data for nid %d: %w", fi.nid, ErrInvalid)
+
+		entryPos := baseOffset + int64(cn*unit)
+		var entryBuf [8]byte
+		if n, err := img.meta.ReadAt(entryBuf[:unit], entryPos); err != nil {
+			return nil, fmt.Errorf("failed to read chunk entry at %d: %w", entryPos, err)
+		} else if n != unit {
+			return nil, fmt.Errorf("short read of chunk entry at %d: read %d bytes, expected %d", entryPos, n, unit)
 		}
-		var rawAddr int32
-		if _, err := binary.Decode(buf[dataOffset:dataOffset+4], binary.LittleEndian, &rawAddr); err != nil {
-			return nil, err
+
+		var addr int64
+		var deviceID uint16
+
+		if unit == 8 {
+			startBlkLo := binary.LittleEndian.Uint32(entryBuf[4:8])
+			if ^startBlkLo == 0 {
+				addr = -1
+			} else {
+				addr = int64(startBlkLo) << img.sb.BlkSizeBits
+				deviceID = binary.LittleEndian.Uint16(entryBuf[2:4]) & img.deviceIDMask
+			}
+		} else {
+			rawAddr := binary.LittleEndian.Uint32(entryBuf[:4])
+			if ^rawAddr == 0 {
+				addr = -1
+			} else {
+				addr = int64(rawAddr) << img.sb.BlkSizeBits
+			}
 		}
 
 		if bn == nblocks-1 {
@@ -318,7 +385,7 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		}
 		blockOffset = int(pos % int64(blockSize))
 
-		if rawAddr == -1 {
+		if addr == -1 {
 			// Null address, return new zero filled block
 			return &block{
 				buf:    make([]byte, 1<<img.sb.BlkSizeBits),
@@ -328,11 +395,30 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		}
 
 		// Add block offset within chunk
-		if pos > 0 {
-			rawAddr += int32((pos - int64(cn<<chunkbits)) >> img.sb.BlkSizeBits)
+		blockPos := int64(bn) << img.sb.BlkSizeBits
+		if blockPos > 0 {
+			addr += (blockPos - int64(cn<<chunkbits))
 		}
 
-		addr = int64(rawAddr) << int64(img.sb.BlkSizeBits)
+		reader := img.meta
+		if deviceID > 0 {
+			if int(deviceID) > len(img.extraDevices) {
+				return nil, fmt.Errorf("invalid device id %d", deviceID)
+			}
+			reader = img.extraDevices[deviceID-1]
+		}
+
+		b := img.getBlock()
+		if n, err := reader.ReadAt(b.buf[blockOffset:blockEnd], addr+int64(blockOffset)); err != nil {
+			img.putBlock(b)
+			return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.nid, err)
+		} else if n != (blockEnd - blockOffset) {
+			img.putBlock(b)
+			return nil, fmt.Errorf("failed to read full block for nid %d: %w", fi.nid, ErrInvalid)
+		}
+		b.offset = int32(blockOffset)
+		b.end = int32(blockEnd)
+		return b, nil
 	case disk.LayoutCompressedFull, disk.LayoutCompressedCompact:
 		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrNotImplemented)
 	default:
@@ -346,8 +432,10 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	b.offset = int32(blockOffset)
 	b.end = int32(blockEnd)
 	if n, err := img.meta.ReadAt(b.bytes(), addr+int64(blockOffset)); err != nil {
+		img.putBlock(b)
 		return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.nid, err)
 	} else if n != blockEnd-blockOffset {
+		img.putBlock(b)
 		return nil, fmt.Errorf("failed to read full block for nid %d: %w, expected %d, actual %d", fi.nid, ErrInvalid, blockEnd-blockOffset, n)
 	}
 	return b, nil
@@ -475,22 +563,26 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 		blk.offset = 0
 		blk.end = disk.SizeInodeExtended
 	}
-	ino := blk.bytes()
-	_, err = b.img.meta.ReadAt(ino, addr)
-	if err != nil {
-		return nil, err
-	}
 
 	defer func() {
 		v := recover()
 		if v != nil {
 			err = fmt.Errorf("file format error: %v", v)
 		}
+		if err != nil {
+			b.img.putBlock(blk)
+		}
 
 	}()
 
+	ino := blk.bytes()
+	_, err = b.img.meta.ReadAt(ino, addr)
+	if err != nil {
+		return nil, err
+	}
+
 	var format, xcnt uint16
-	if _, err := binary.Decode(ino[:2], binary.LittleEndian, &format); err != nil {
+	if _, err = binary.Decode(ino[:2], binary.LittleEndian, &format); err != nil {
 		return nil, err
 	}
 
@@ -528,7 +620,7 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 		addr += disk.SizeInodeCompact
 	} else {
 		var inode disk.InodeExtended
-		if _, err := binary.Decode(ino[:disk.SizeInodeExtended], binary.LittleEndian, &inode); err != nil {
+		if _, err = binary.Decode(ino[:disk.SizeInodeExtended], binary.LittleEndian, &inode); err != nil {
 			return nil, err
 		}
 		b.info = &fileInfo{
@@ -564,7 +656,7 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 	}
 
 	if infoOnly && b.info.xsize > 0 {
-		if err := setXattrs(b, addr, blk); err != nil {
+		if err = setXattrs(b, addr, blk); err != nil {
 			return nil, err
 		}
 	} else if infoOnly || b.info.inodeLayout == disk.LayoutFlatPlain || b.info.size == 0 || blk.end != blkSize {

@@ -15,19 +15,26 @@ import (
 	"github.com/erofs/go-erofs/internal/tartest"
 )
 
+const (
+	longPrefix = "user.long.prefix.vfvzyrvujoemkjztekxczhyyqpzncyav.xiksvigqpjttnvcvxgaxpnrghppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwd."
+	longValue  = "value1-ppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwdqfgvgkrgdwcegjpfmelrejllrjkpbwindlfynuzjgvcgygyayjvmtxgsbjkzrydoswbsknrrwjkwzxhasowuzdoxlhbxso"
+)
+
 func TestBasic(t *testing.T) {
 	minChunk := os.Getpagesize()
 	for _, tc := range []struct {
-		name     string
-		mkfsArgs []string
+		name string
+		opts []createOpt
 	}{
-		{"default", []string{}},
-		{fmt.Sprintf("chunk-%d", minChunk), []string{fmt.Sprintf("--chunksize=%d", minChunk)}},
-		{fmt.Sprintf("chunk-%d", minChunk*2), []string{fmt.Sprintf("--chunksize=%d", minChunk*2)}},
+		{"default", nil},
+		{fmt.Sprintf("chunk-%d", minChunk), []createOpt{withChunkSize(minChunk)}},
+		{fmt.Sprintf("chunk-%d", minChunk*2), []createOpt{withChunkSize(minChunk * 2)}},
+		{"chunk-index", []createOpt{withBlobDev}},
 		// TODO: Add compressed layout
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			efs, err := EroFS(createTestFile(t, tc.name, tc.mkfsArgs))
+			er, eopts := createTestFile(t, tc.name, tc.opts...)
+			efs, err := EroFS(er, eopts...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -67,9 +74,6 @@ func TestBasic(t *testing.T) {
 				"user.xdg.comment": "comment for f4",
 				"user.common":      "same-value",
 			})
-			// Value is defined in /usr/lib/generated/generate.sh of testdata
-			longPrefix := "user.long.prefix.vfvzyrvujoemkjztekxczhyyqpzncyav.xiksvigqpjttnvcvxgaxpnrghppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwd."
-			longValue := "value1-ppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwdqfgvgkrgdwcegjpfmelrejllrjkpbwindlfynuzjgvcgygyayjvmtxgsbjkzrydoswbsknrrwjkwzxhasowuzdoxlhbxso"
 			checkXattrs(t, efs, "/usr/lib/generated/xattrs/long-prefix-xattrs", map[string]string{
 				longPrefix + "long-value": longValue,
 				longPrefix + "shortvalue": "y",
@@ -87,18 +91,46 @@ func TestBasic(t *testing.T) {
 	}
 }
 
-func createTestFile(t testing.TB, name string, mkfsArgs []string) *os.File {
+type createOptions struct {
+	chunkSize int
+	blobDev   bool
+}
+
+type createOpt func(*createOptions)
+
+func withChunkSize(chunkSize int) createOpt {
+	return func(o *createOptions) {
+		o.chunkSize = chunkSize
+	}
+}
+
+func withBlobDev(o *createOptions) {
+	o.blobDev = true
+}
+
+func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, []Opt) {
 	t.Helper()
 
-	longPrefix := "user.long.prefix.vfvzyrvujoemkjztekxczhyyqpzncyav.xiksvigqpjttnvcvxgaxpnrghppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwd."
-	longValue := "value1-ppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwdqfgvgkrgdwcegjpfmelrejllrjkpbwindlfynuzjgvcgygyayjvmtxgsbjkzrydoswbsknrrwjkwzxhasowuzdoxlhbxso"
+	var (
+		options  createOptions
+		mkfsArgs []string
+	)
+	for _, opt := range opts {
+		opt(&options)
+	}
+	if options.chunkSize != 0 {
+		mkfsArgs = append(mkfsArgs, fmt.Sprintf("--chunksize=%d", options.chunkSize))
+	}
 
 	tc := tartest.TarContext{}.WithModTime(time.Now().UTC())
 
-	var lotsOfFiles []tartest.WriterToTar
-	for i := range 5000 {
-		lotsOfFiles = append(lotsOfFiles, tc.File(fmt.Sprintf("/usr/lib/testdir/lotsoffiles/%d", i), []byte{}, 0600))
-	}
+	lotsOfFilesC := make(chan tartest.WriterToTar)
+	go func() {
+		for i := range 5000 {
+			lotsOfFilesC <- tc.File(fmt.Sprintf("/usr/lib/testdir/lotsoffiles/%d", i), []byte{}, 0600)
+		}
+		close(lotsOfFilesC)
+	}()
 
 	writerTo := tartest.TarAll(
 		tc.File("/in-root.txt", []byte("root file content\n"), 0600),
@@ -148,10 +180,21 @@ func createTestFile(t testing.TB, name string, mkfsArgs []string) *os.File {
 	)
 
 	writerTo = tartest.TarAll(
-		append(lotsOfFiles, writerTo)...,
+		writerTo,
+		tartest.TarStream(lotsOfFilesC),
 	)
 
-	path := filepath.Join(t.TempDir(), name+".erofs")
+	td := t.TempDir()
+	path := filepath.Join(td, name+".erofs")
+	blobDataPath := ""
+	if options.blobDev {
+		blobDataPath = filepath.Join(td, name+"-data.erofs")
+		mkfsArgs = append(mkfsArgs, fmt.Sprintf("--blobdev=%s", blobDataPath))
+		if options.chunkSize == 0 {
+			mkfsArgs = append(mkfsArgs, fmt.Sprintf("--chunksize=%d", os.Getpagesize()))
+		}
+	}
+
 	err := tartest.ConvertTarErofs(context.Background(), tartest.TarFromWriterTo(writerTo), path, "", mkfsArgs)
 	if err != nil {
 		t.Fatal(err)
@@ -160,8 +203,18 @@ func createTestFile(t testing.TB, name string, mkfsArgs []string) *os.File {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var eOpts []Opt
+	if blobDataPath != "" {
+		bf, err := os.Open(blobDataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { bf.Close() })
+
+		eOpts = append(eOpts, WithExtraDevices(bf))
+	}
 	t.Cleanup(func() { f.Close() })
-	return f
+	return f, eOpts
 }
 
 func checkFileString(t testing.TB, fsys fs.FS, name, content string) {

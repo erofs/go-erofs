@@ -5,9 +5,10 @@ const (
 	SuperBlockOffset = 1024
 
 	FeatureIncompatChunkedFile          = 0x4
+	FeatureIncompatDeviceTable          = 0x8
 	FeatureIncompatFragments            = 0x20
 	FeatureIncompatXattrPrefixes        = 0x40
-	FeatureIncompatAll           uint32 = FeatureIncompatChunkedFile | FeatureIncompatFragments | FeatureIncompatXattrPrefixes
+	FeatureIncompatAll           uint32 = FeatureIncompatChunkedFile | FeatureIncompatDeviceTable | FeatureIncompatFragments | FeatureIncompatXattrPrefixes
 
 	SizeSuperBlock      = 128
 	SizeInodeCompact    = 32
@@ -24,6 +25,7 @@ const (
 
 	LayoutChunkFormatBits    = 0x001F
 	LayoutChunkFormatIndexes = 0x0020
+	LayoutChunkFormat48Bit   = 0x0040
 )
 
 // SuperBlock represents the EROFS on-disk superblock.
@@ -130,4 +132,10 @@ type XattrLongPrefixitem struct {
 type XattrLongPrefix struct {
 	BaseIndex uint8 // short xattr name prefix index
 	// Infix part after short prefix
+}
+
+type InodeChunkIndex struct {
+	StartBlkHi uint16 // part of 48-bit support (not yet implemented)
+	DeviceID   uint16
+	StartBlkLo uint32
 }
