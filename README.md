@@ -15,8 +15,8 @@ could provide an interface to create erofs files as well.
 - [x] Read chunk-based erofs files (without indexes)
 - [x] Xattr support
 - [x] Long xattr prefix support
+- [x] Extra devices for chunked data and chunk indexes
 - [ ] Read erofs files with compression
-- [ ] Extra devices for chunked data and chunk indexes
 - [ ] Creating erofs files
 - [ ] Tar to erofs conversion
 
