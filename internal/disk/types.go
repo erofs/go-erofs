@@ -21,6 +21,8 @@ const (
 	LayoutChunkFormatIndexes = 0x0020
 )
 
+// SuperBlock represents the EROFS on-disk superblock.
+// See: https://docs.kernel.org/filesystems/erofs.html#on-disk-layout
 type SuperBlock struct {
 	MagicNumber      uint32
 	Checksum         uint32
@@ -43,38 +45,40 @@ type SuperBlock struct {
 	DirBlkBits       uint8
 	XattrPrefixCount uint8
 	XattrPrefixStart uint32
-	PackedNid        uint64
+	PackedNid        uint64 // Nid of the special "packed" inode for shared data/prefixes
 	XattrFilterRes   uint8
 	Reserved         [23]uint8
 }
 
+// InodeCompact represents the 32-byte on-disk compact inode.
 type InodeCompact struct {
-	Format       uint16
-	XattrCount   uint16
-	Mode         uint16
-	Nlink        uint16
-	Size         uint32
-	Reserved     uint32
-	InodeData    uint32
-	Inode        uint32
-	UID          uint16
-	GID          uint16
-	Reserved2    uint32
+	Format     uint16 // i_format
+	XattrCount uint16 // i_xattr_icount
+	Mode       uint16 // i_mode
+	Nlink      uint16 // i_nlink
+	Size       uint32 // i_size
+	Reserved   uint32 // i_reserved
+	InodeData  uint32 // i_u (i_raw_blkaddr, i_rdev, etc.)
+	Inode      uint32 // i_ino
+	UID        uint16 // i_uid
+	GID        uint16 // i_gid
+	Reserved2  uint32 // i_reserved2
 }
 
+// InodeExtended represents the 64-byte on-disk extended inode.
 type InodeExtended struct {
-	Format     uint16
-	XattrCount uint16
-	Mode       uint16
-	Reserved   uint16
-	Size       uint64
-	InodeData  uint32 // RawBlockAddr | Rdev | Compressed Count | Chunk Format
-	Inode      uint32
-	UID        uint32
-	GID        uint32
-	Mtime      uint64
-	MtimeNs    uint32
-	Nlink      uint32
+	Format     uint16 // i_format
+	XattrCount uint16 // i_xattr_icount
+	Mode       uint16 // i_mode
+	Reserved   uint16 // i_reserved
+	Size       uint64 // i_size
+	InodeData  uint32 // i_u (i_raw_blkaddr, i_rdev, etc.)
+	Inode      uint32 // i_ino
+	UID        uint32 // i_uid
+	GID        uint32 // i_gid
+	Mtime      uint64 // i_mtime
+	MtimeNs    uint32 // i_mtime_nsec
+	Nlink      uint32 // i_nlink
 	Reserved2  [16]uint8
 }
 
