@@ -15,10 +15,15 @@ func TestBasic(t *testing.T) {
 		"default",
 		"chunk-4096",
 		"chunk-8192",
+		"chunk-index",
 		// TODO: Add compressed layout
 	} {
 		t.Run(name, func(t *testing.T) {
-			efs, err := EroFS(loadTestFile(t, "basic-"+name))
+			var opts []Opt
+			if name == "chunk-index" {
+				opts = append(opts, WithExtraDevices(loadTestFile(t, "basic-chunk-index-data")))
+			}
+			efs, err := EroFS(loadTestFile(t, "basic-"+name), opts...)
 			if err != nil {
 				t.Fatal(err)
 			}
