@@ -48,7 +48,7 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 		b.img.putBlock(blk)
 		blk, err = b.img.loadAt(addr, int64(b.info.xsize))
 		if err != nil {
-			return fmt.Errorf("failed to read xattr body for nid %d: %w", b.inode, err)
+			return fmt.Errorf("failed to read xattr body for nid %d: %w", b.nid, err)
 		}
 	}
 	var (
@@ -66,7 +66,7 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 			b.img.putBlock(blk)
 			blk, err = b.img.loadAt(addr+pos, int64(b.info.xsize)-pos)
 			if err != nil {
-				return fmt.Errorf("failed to read xattr body for nid %d: %w", b.inode, err)
+				return fmt.Errorf("failed to read xattr body for nid %d: %w", b.nid, err)
 			}
 			xb = blk.bytes()
 		}
@@ -78,7 +78,7 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 		// TODO: Cache shared xattr blocks
 		blk, err := b.img.loadAt(int64(b.img.sb.XattrBlkAddr)<<b.img.sb.BlkSizeBits+int64(xattrAddr*4), int64(blkSize))
 		if err != nil {
-			return fmt.Errorf("failed to read shared xattr body for nid %d: %w", b.inode, err)
+			return fmt.Errorf("failed to read shared xattr body for nid %d: %w", b.nid, err)
 		}
 		sb := blk.bytes()
 		var xattrEntry disk.XattrEntry
@@ -93,14 +93,14 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 			var err error
 			prefix, err = b.img.getLongPrefix(longPrefixIndex)
 			if err != nil {
-				return fmt.Errorf("failed to get long prefix for shared xattr nid %d: %w", b.inode, err)
+				return fmt.Errorf("failed to get long prefix for shared xattr nid %d: %w", b.nid, err)
 			}
 		} else if xattrEntry.NameIndex != 0 {
 			prefix = xattrIndex(xattrEntry.NameIndex).String()
 		}
 
 		if len(sb) < int(xattrEntry.NameLen)+int(xattrEntry.ValueLen) {
-			return fmt.Errorf("shared xattr too long for inode %d", b.inode)
+			return fmt.Errorf("shared xattr too long for nid %d", b.nid)
 		}
 		name := prefix + string(sb[:xattrEntry.NameLen])
 		sb = sb[xattrEntry.NameLen:]
@@ -114,7 +114,7 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 		b.img.putBlock(blk)
 		blk, err = b.img.loadAt(addr+int64(pos), int64(b.info.xsize-pos))
 		if err != nil {
-			return fmt.Errorf("failed to read xattr body for nid %d: %w", b.inode, err)
+			return fmt.Errorf("failed to read xattr body for nid %d: %w", b.nid, err)
 		}
 		xb = blk.bytes()
 		return nil
@@ -139,7 +139,7 @@ func setXattrs(b *file, addr int64, blk *block) (err error) {
 			var err error
 			prefix, err = b.img.getLongPrefix(longPrefixIndex)
 			if err != nil {
-				return fmt.Errorf("failed to get long prefix for inline xattr nid %d: %w", b.inode, err)
+				return fmt.Errorf("failed to get long prefix for inline xattr nid %d: %w", b.nid, err)
 			}
 		} else if xattrEntry.NameIndex != 0 {
 			prefix = xattrIndex(xattrEntry.NameIndex).String()
