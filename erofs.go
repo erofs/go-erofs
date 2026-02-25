@@ -74,6 +74,11 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	if i.sb.BlkSizeBits < 9 || i.sb.BlkSizeBits > 16 {
 		return nil, fmt.Errorf("unsupported block size bits %d: %w", i.sb.BlkSizeBits, ErrInvalidSuperblock)
 	}
+	unknownFeat := i.sb.FeatureIncompat &^ disk.FeatureIncompatAll
+	if unknownFeat != 0 {
+		return nil, fmt.Errorf("unsupported incompatible feature 0x%x: %w", unknownFeat, ErrNotImplemented)
+	}
+
 	i.blkPool.New = func() any {
 		return &block{
 			buf: make([]byte, 1<<i.sb.BlkSizeBits),
@@ -475,7 +480,7 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 
 	}()
 
-	var format uint16
+	var format, xcnt uint16
 	if _, err := binary.Decode(ino[:2], binary.LittleEndian, &format); err != nil {
 		return nil, err
 	}
@@ -494,24 +499,21 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 			inodeData:   inode.InodeData,
 			size:        int64(inode.Size),
 			mode:        (fs.FileMode(inode.Mode) & ^fs.ModeType) | b.ftype,
-			//modTime: time.Unix(int64(inode.Mtime), int64(inode.MtimeNs)),
-			// TODO: Set mtime to zero value?
+			modTime:     time.Unix(int64(b.img.sb.BuildTime), int64(b.img.sb.BuildTimeNs)),
 		}
-		if inode.XattrCount > 0 {
-			b.info.xsize = int(inode.XattrCount-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
-		}
+		xcnt = inode.XattrCount
 		if infoOnly {
 			b.info.stat = &Stat{
 				Mode:        disk.EroFSModeToGoFileMode(inode.Mode),
 				Size:        int64(inode.Size),
 				InodeLayout: layout,
-				Inode:       int64(inode.Inode),
+				Inode:       int64(b.nid),
 				Rdev:        disk.RdevFromMode(inode.Mode, inode.InodeData),
 				UID:         uint32(inode.UID),
 				GID:         uint32(inode.GID),
 				Nlink:       int(inode.Nlink),
-				//Mtime        uint64
-				//MtimeNs      uint32
+				Mtime:       b.img.sb.BuildTime,
+				MtimeNs:     b.img.sb.BuildTimeNs,
 			}
 		}
 		addr += disk.SizeInodeCompact
@@ -530,15 +532,13 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 			mode:        (fs.FileMode(inode.Mode) & ^fs.ModeType) | b.ftype,
 			modTime:     time.Unix(int64(inode.Mtime), int64(inode.MtimeNs)),
 		}
-		if inode.XattrCount > 0 {
-			b.info.xsize = int(inode.XattrCount-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
-		}
+		xcnt = inode.XattrCount
 		if infoOnly {
 			b.info.stat = &Stat{
 				Mode:        disk.EroFSModeToGoFileMode(inode.Mode),
 				Size:        int64(inode.Size),
 				InodeLayout: layout,
-				Inode:       int64(inode.Inode),
+				Inode:       int64(b.nid),
 				Rdev:        disk.RdevFromMode(inode.Mode, inode.InodeData),
 				UID:         uint32(inode.UID),
 				GID:         uint32(inode.GID),
@@ -548,6 +548,10 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 			}
 		}
 		addr += disk.SizeInodeExtended
+	}
+
+	if xcnt > 0 {
+		b.info.xsize = int(xcnt-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
 	}
 
 	if infoOnly && b.info.xsize > 0 {
