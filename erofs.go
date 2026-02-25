@@ -69,9 +69,10 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 	if err = decodeSuperBlock(superBlock, &i.sb); err != nil {
 		return nil, err
 	}
-	// TODO: check valid
-	if i.sb.BlkSizeBits < 9 || i.sb.BlkSizeBits > 24 {
-		return nil, fmt.Errorf("invalid super block: block size bits %d", i.sb.BlkSizeBits)
+	// The maximum reasonable filesystem block size is 64k, which is
+	// the largest supported page size of aarch64 platforms.
+	if i.sb.BlkSizeBits < 9 || i.sb.BlkSizeBits > 16 {
+		return nil, fmt.Errorf("unsupported block size bits %d: %w", i.sb.BlkSizeBits, ErrInvalidSuperblock)
 	}
 	i.blkPool.New = func() any {
 		return &block{
@@ -92,7 +93,8 @@ type image struct {
 	prefixesErr  error
 }
 
-func (img *image) blkOffset() int64 {
+// start physical offset of the separate metadata zone
+func (img *image) metaStartPos() int64 {
 	return int64(img.sb.MetaBlkAddr) << int64(img.sb.BlkSizeBits)
 }
 
@@ -116,7 +118,7 @@ func (img *image) loadLongPrefixes() error {
 		f := &file{
 			img:   img,
 			name:  ".packed",
-			inode: img.sb.PackedNid,
+			nid:   img.sb.PackedNid,
 			ftype: 0, // regular file
 		}
 
@@ -248,9 +250,9 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	case disk.LayoutFlatInline:
 		// If on the last block, validate
 		if bn == nblocks-1 {
-			addr = img.blkOffset() + int64(fi.inode*disk.SizeInodeCompact)
+			addr = img.metaStartPos() + int64(fi.nid*disk.SizeInodeCompact)
 			// Move to the data offset from the start of the inode
-			addr += fi.dataOffset()
+			addr += fi.flatDataOffset()
 
 			// Get the ooffset from the start of the block
 			blockOffset = int(addr & int64(blockSize-1))
@@ -259,7 +261,7 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 
 			// Ensure the last block is not exceeded
 			if blockEnd > blockSize {
-				return nil, fmt.Errorf("inline data cross block boundary for nid %d: %w", fi.inode, ErrInvalid)
+				return nil, fmt.Errorf("inline data cross block boundary for nid %d: %w", fi.nid, ErrInvalid)
 			}
 			// Move the offset within the block based on position within file
 			blockOffset += int(pos - int64(bn<<int(img.sb.BlkSizeBits)))
@@ -270,17 +272,17 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		// first 2 le bytes for format, second 2 bytes are reserved
 		format := uint16(fi.inodeData)
 		if format&^(disk.LayoutChunkFormatBits|disk.LayoutChunkFormatIndexes) != 0 {
-			return nil, fmt.Errorf("unsupported chunk format %x for nid %d: %w", format, fi.inode, ErrInvalid)
+			return nil, fmt.Errorf("unsupported chunk format %x for nid %d: %w", format, fi.nid, ErrInvalid)
 		}
 		if format&disk.LayoutChunkFormatIndexes == disk.LayoutChunkFormatIndexes {
-			return nil, fmt.Errorf("chunk format with indexes for nid %d: %w", fi.inode, ErrNotImplemented)
+			return nil, fmt.Errorf("chunk format with indexes for nid %d: %w", fi.nid, ErrNotImplemented)
 		}
 		chunkbits := img.sb.BlkSizeBits + uint8(format&disk.LayoutChunkFormatBits)
 		chunkn := int((fi.size-1)>>chunkbits) + 1
 		cn := int(pos >> chunkbits)
 
 		if cn >= chunkn {
-			return nil, fmt.Errorf("chunk format does not fit into allocated bytes for nid %d: %w", fi.inode, ErrInvalid)
+			return nil, fmt.Errorf("chunk format does not fit into allocated bytes for nid %d: %w", fi.nid, ErrInvalid)
 		}
 
 		if fi.cached == nil {
@@ -289,9 +291,9 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		}
 		buf := fi.cached.bytes()
 		// TODO: Or support indexes
-		dataOffset := fi.dataOffset() + int64(cn*4)
+		dataOffset := fi.flatDataOffset() + int64(cn*4)
 		if len(buf) < int(dataOffset)+4 {
-			return nil, fmt.Errorf("invalid chunk data for nid %d: %w", fi.inode, ErrInvalid)
+			return nil, fmt.Errorf("invalid chunk data for nid %d: %w", fi.nid, ErrInvalid)
 		}
 		var rawAddr int32
 		if _, err := binary.Decode(buf[dataOffset:dataOffset+4], binary.LittleEndian, &rawAddr); err != nil {
@@ -317,9 +319,9 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 
 		addr = int64(rawAddr) << int64(img.sb.BlkSizeBits)
 	case disk.LayoutCompressedFull, disk.LayoutCompressedCompact:
-		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.inode, ErrNotImplemented)
+		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrNotImplemented)
 	default:
-		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.inode, ErrInvalid)
+		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrInvalid)
 	}
 	if blockOffset >= blockEnd {
 		return nil, fmt.Errorf("no remaining items in block: %w", io.EOF)
@@ -327,9 +329,9 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 
 	b := img.getBlock()
 	if n, err := img.meta.ReadAt(b.buf[blockOffset:blockEnd], addr); err != nil {
-		return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.inode, err)
+		return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.nid, err)
 	} else if n != (blockEnd - blockOffset) {
-		return nil, fmt.Errorf("failed to read full block for nid %d: %w", fi.inode, ErrInvalid)
+		return nil, fmt.Errorf("failed to read full block for nid %d: %w", fi.nid, ErrInvalid)
 	}
 	b.offset = int32(blockOffset)
 	b.end = int32(blockEnd)
@@ -392,7 +394,7 @@ func (i *image) Open(name string) (fs.File, error) {
 			file: file{
 				img:   i,
 				name:  parent,
-				inode: nid,
+				nid:   nid,
 				ftype: ftype,
 			},
 		}
@@ -404,7 +406,7 @@ func (i *image) Open(name string) (fs.File, error) {
 		var found bool
 		for _, e := range entries {
 			if e.Name() == basename {
-				nid = uint64(e.(*direntry).file.inode)
+				nid = uint64(e.(*direntry).file.nid)
 				ftype = e.(*direntry).file.ftype & fs.ModeType
 				found = true
 			}
@@ -422,7 +424,7 @@ func (i *image) Open(name string) (fs.File, error) {
 	b := file{
 		img:   i,
 		name:  basename,
-		inode: nid,
+		nid:   nid,
 		ftype: ftype,
 	}
 	if ftype.IsDir() {
@@ -435,7 +437,7 @@ func (i *image) Open(name string) (fs.File, error) {
 type file struct {
 	img   *image
 	name  string
-	inode uint64
+	nid   uint64
 	ftype fs.FileMode
 
 	// Mutable fields, open file should not be accessed concurrently
@@ -448,7 +450,7 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 		return b.info, nil
 	}
 
-	addr := b.img.blkOffset() + int64(b.inode*disk.SizeInodeCompact)
+	addr := b.img.metaStartPos() + int64(b.nid*disk.SizeInodeCompact)
 	blkSize := int32(1 << b.img.sb.BlkSizeBits)
 	blk := b.img.getBlock()
 	blk.offset = int32(addr & int64(blkSize-1))
@@ -486,8 +488,8 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 		}
 		b.info = &fileInfo{
 			name:        b.name,
-			inode:       b.inode,
-			isize:       disk.SizeInodeCompact,
+			nid:         b.nid,
+			icsize:      disk.SizeInodeCompact,
 			inodeLayout: layout,
 			inodeData:   inode.InodeData,
 			size:        int64(inode.Size),
@@ -520,8 +522,8 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 		}
 		b.info = &fileInfo{
 			name:        b.name,
-			inode:       b.inode,
-			isize:       disk.SizeInodeExtended,
+			nid:         b.nid,
+			icsize:      disk.SizeInodeExtended,
 			inodeLayout: layout,
 			inodeData:   inode.InodeData,
 			size:        int64(inode.Size),
@@ -683,7 +685,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 				b := file{
 					img:   d.file.img,
 					name:  name,
-					inode: dirents[0].Nid,
+					nid:   dirents[0].Nid,
 					ftype: disk.EroFSFtypeToFileMode(dirents[0].FileType),
 				}
 				ents = append(ents, &direntry{b})
@@ -712,8 +714,8 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 
 type fileInfo struct {
 	name        string
-	inode       uint64
-	isize       int8
+	nid         uint64
+	icsize      int8
 	xsize       int
 	inodeLayout uint8
 	inodeData   uint32
@@ -748,9 +750,9 @@ func (fi *fileInfo) Sys() any {
 	return fi.stat
 }
 
-func (fi *fileInfo) dataOffset() int64 {
-	// inode size + xattr size
-	return int64(fi.isize) + int64(fi.xsize)
+func (fi *fileInfo) flatDataOffset() int64 {
+	// inode core size + xattr size
+	return int64(fi.icsize) + int64(fi.xsize)
 }
 func decodeSuperBlock(b [disk.SizeSuperBlock]byte, sb *disk.SuperBlock) error {
 	n, err := binary.Decode(b[:], binary.LittleEndian, sb)
