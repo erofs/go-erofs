@@ -103,6 +103,37 @@ func (img *image) metaStartPos() int64 {
 	return int64(img.sb.MetaBlkAddr) << int64(img.sb.BlkSizeBits)
 }
 
+func (img *image) readMetadata(r io.Reader) ([]byte, error) {
+	// - A 2-byte little-endian length field, which is aligned to a 4-byte boundary
+	// - The length bytes of payload data
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("failed to read metadata length %v: %w", lenBuf, err)
+	}
+
+	dataLen := int(binary.LittleEndian.Uint16(lenBuf[:]))
+	if dataLen < 1 {
+		dataLen = 65536
+	}
+
+	data := make([]byte, dataLen)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, fmt.Errorf("failed to read metadata payload: %w", err)
+	}
+
+	// Align to 4-byte boundary except for hitting EOF
+	totalLen := 2 + dataLen
+	if rem := totalLen % 4; rem != 0 {
+		padding := int64(4 - rem)
+		if _, err := io.CopyN(io.Discard, r, padding); err != nil &&
+			!errors.Is(err, io.EOF) &&
+			!errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("failed to discard padding of %d bytes: %w", padding, err)
+		}
+	}
+	return data, nil
+}
+
 // loadLongPrefixes loads and caches the long xattr prefixes from the packed inode
 // using the regular inode read logic to handle compressed/non-inline data.
 //
@@ -116,61 +147,49 @@ func (img *image) loadLongPrefixes() error {
 			return
 		}
 
-		// Long prefixes are stored in the packed inode at offset XattrPrefixStart * 4.
-		// The packed inode (identified by PackedNid in the superblock) is a special
-		// inode used for shared data and metadata.
-		// We use ".packed" as a descriptive name for this internal inode.
-		f := &file{
-			img:   img,
-			name:  ".packed",
-			nid:   img.sb.PackedNid,
-			ftype: 0, // regular file
-		}
-
-		// Read inode info to determine size and layout
-		fi, err := f.readInfo(false)
-		if err != nil {
-			img.prefixesErr = fmt.Errorf("failed to read packed inode: %w", err)
-			return
-		}
+		var r io.Reader
 
 		// Calculate the starting offset. XattrPrefixStart is defined in the
-		// superblock as being in units of 4 bytes from the start of the
-		// packed inode's data.
+		// superblock as being in units of 4 bytes from the start of the corresponding inode
 		startOffset := int64(img.sb.XattrPrefixStart) * 4
-		if startOffset > fi.size {
-			img.prefixesErr = fmt.Errorf("xattr prefix start offset %d exceeds packed inode size %d", startOffset, fi.size)
-			return
+
+		if (img.sb.FeatureIncompat&disk.FeatureIncompatFragments != 0) && img.sb.PackedNid > 0 {
+			// The packed inode (identified by PackedNid in the superblock) is a special
+			// inode used for shared data and metadata.
+			// We use ".packed" as a descriptive name for this internal inode.
+			f := &file{
+				img:   img,
+				name:  ".packed",
+				nid:   img.sb.PackedNid,
+				ftype: 0, // regular file
+			}
+
+			// Read inode info to determine size and layout
+			fi, err := f.readInfo(false)
+			if err != nil {
+				img.prefixesErr = fmt.Errorf("failed to read packed inode: %w", err)
+				return
+			}
+
+			if startOffset > fi.size {
+				img.prefixesErr = fmt.Errorf("xattr prefix start offset %d exceeds packed inode size %d", startOffset, fi.size)
+				return
+			}
+
+			// Set the read offset
+			f.offset = startOffset
+			r = bufio.NewReader(f)
+		} else {
+			// FIXME(hsiangkao): should avoid hacky 1<<32 here since we don't care about the end
+			r = io.NewSectionReader(img.meta, startOffset, 1<<32)
 		}
 
-		// Set the read offset
-		f.offset = startOffset
-
-		r := bufio.NewReader(f)
 		img.longPrefixes = make([]string, img.sb.XattrPrefixCount)
-
 		for i := 0; i < int(img.sb.XattrPrefixCount); i++ {
-			// Each long prefix entry consists of:
-			// - A 2-byte little-endian length field (prefixLen)
-			// - A 1-byte base_index (short xattr prefix)
-			// - The infix string of length prefixLen - 1
-			// - Padding to align the entire entry (2 + prefixLen) to a 4-byte boundary.
-			var lenBuf [2]byte
-			if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-				img.prefixesErr = fmt.Errorf("failed to read long xattr prefix length at index %d: %w", i, err)
-				return
-			}
-			prefixLen := int(binary.LittleEndian.Uint16(lenBuf[:]))
-
-			if prefixLen < 1 {
-				img.prefixesErr = fmt.Errorf("invalid long xattr prefix length %d at index %d", prefixLen, i)
-				return
-			}
-
-			// Read data (base_index + infix)
-			data := make([]byte, prefixLen)
-			if _, err := io.ReadFull(r, data); err != nil {
-				img.prefixesErr = fmt.Errorf("failed to read long xattr prefix data at index %d: %w", i, err)
+			data, err := img.readMetadata(r)
+			if err != nil {
+				img.prefixesErr =
+					fmt.Errorf("failed to read long xattr prefix %d: %w", i, err)
 				return
 			}
 
@@ -182,24 +201,8 @@ func (img *image) loadLongPrefixes() error {
 
 			// Construct full prefix: base prefix + infix
 			img.longPrefixes[i] = baseIndex.String() + infix
-
-			// Align to 4-byte boundary. The entry starts with a 2-byte length field
-			// followed by prefixLen bytes of data.
-			totalLen := 2 + prefixLen
-			if rem := totalLen % 4; rem != 0 {
-				padding := 4 - rem
-				if _, err := r.Discard(padding); err != nil {
-					// If we are at the last prefix and hit EOF, it's acceptable if the file ends without padding
-					if i == int(img.sb.XattrPrefixCount)-1 && errors.Is(err, io.EOF) {
-						return
-					}
-					img.prefixesErr = fmt.Errorf("failed to discard padding at index %d: %w", i, err)
-					return
-				}
-			}
 		}
 	})
-
 	return img.prefixesErr
 }
 
