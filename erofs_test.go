@@ -2,23 +2,32 @@ package erofs
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/erofs/go-erofs/internal/tartest"
 )
 
 func TestBasic(t *testing.T) {
 
-	for _, name := range []string{
-		"default",
-		"chunk-4096",
-		"chunk-8192",
+	for _, tc := range []struct {
+		name     string
+		mkfsArgs []string
+	}{
+		{"default", []string{}},
+		{"chunk-4096", []string{"--chunksize=4096"}},
+		{"chunk-8192", []string{"--chunksize=8192"}},
 		// TODO: Add compressed layout
 	} {
-		t.Run(name, func(t *testing.T) {
-			efs, err := EroFS(loadTestFile(t, "basic-"+name))
+		t.Run(tc.name, func(t *testing.T) {
+			efs, err := EroFS(createTestFile(t, tc.name, tc.mkfsArgs))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -78,15 +87,80 @@ func TestBasic(t *testing.T) {
 	}
 }
 
-func loadTestFile(t testing.TB, name string) io.ReaderAt {
+func createTestFile(t testing.TB, name string, mkfsArgs []string) *os.File {
 	t.Helper()
-	f, err := os.Open("testdata/" + name + ".erofs")
+
+	longPrefix := "user.long.prefix.vfvzyrvujoemkjztekxczhyyqpzncyav.xiksvigqpjttnvcvxgaxpnrghppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwd."
+	longValue := "value1-ppufylkopprkdsfncibznsvmbicfknlkbnuntpuqmwffxkrnuhtpucxwllkxrfzmbvmdcluahylidncngjrxnlipwikplkxgfpiiiqtzsnigpcojpkxtzbzqcosttdxhtspbxltuezcakskakmskmaznvpwcqjakbyapaglwdqfgvgkrgdwcegjpfmelrejllrjkpbwindlfynuzjgvcgygyayjvmtxgsbjkzrydoswbsknrrwjkwzxhasowuzdoxlhbxso"
+
+	tc := tartest.TarContext{}.WithModTime(time.Now().UTC())
+
+	var lotsOfFiles []tartest.WriterToTar
+	for i := range 5000 {
+		lotsOfFiles = append(lotsOfFiles, tc.File(fmt.Sprintf("/usr/lib/testdir/lotsoffiles/%d", i), []byte{}, 0600))
+	}
+
+	writerTo := tartest.TarAll(
+		tc.File("/in-root.txt", []byte("root file content\n"), 0600),
+		tc.File("/usr/lib/testdir/emptyfile", []byte{}, 0600),
+		tc.File("/usr/lib/testdir/13k-zeros.raw", bytes.Repeat([]byte{0}, 1024*13), 0600),
+		tc.File("/usr/lib/testdir/16k-zeros.raw", bytes.Repeat([]byte{0}, 1024*16), 0600),
+		tc.File("/usr/lib/testdir/5k-sequence.raw", bytes.Repeat([]byte{1, 2, 3, 4, 5, 6, 7, 8}, 128*5), 0600),
+		tc.File("/usr/lib/testdir/16k-sequence.raw", bytes.Repeat([]byte{1, 2, 3, 4, 5, 6, 7, 8}, 128*16), 0600),
+		tc.Dir("/usr/lib/testdir/emptydir", 0600),
+		tc.File("/usr/lib/testdir/case/file.txt", []byte("lower case dir\n"), 0600),
+		tc.File("/usr/lib/testdir/CASE/file.txt", []byte("upper case dir\n"), 0600),
+		tc.File("/usr/lib/testdir/case.txt", []byte("lower case file\n"), 0600),
+		tc.File("/usr/lib/testdir/CASE.txt", []byte("upper case file\n"), 0600),
+		tc.WithXattrs(map[string]string{
+			"user.custom":      "value1",
+			"user.xdg.comment": "some random comment",
+		}).Dir("/usr/lib/withxattr", 0600),
+		tc.WithXattrs(map[string]string{
+			"user.xdg.comment": "comment for f1",
+			"user.common":      "same-value",
+		}).File("/usr/lib/withxattr/f1", []byte{}, 0600),
+		tc.WithXattrs(map[string]string{
+			"user.xdg.comment": "comment for f2",
+			"user.common":      "same-value",
+		}).File("/usr/lib/withxattr/f2", []byte{}, 0600),
+		tc.WithXattrs(map[string]string{
+			"user.xdg.comment": "comment for f3",
+			"user.common":      "same-value",
+		}).File("/usr/lib/withxattr/f3", []byte{}, 0600),
+		tc.WithXattrs(map[string]string{
+			"user.xdg.comment": "comment for f4",
+			"user.common":      "same-value",
+		}).File("/usr/lib/withxattr/f4", []byte{}, 0600),
+		tc.WithXattrs(map[string]string{
+			longPrefix + "long-value": longValue,
+			longPrefix + "shortvalue": "y",
+		}).File("/usr/lib/generated/xattrs/long-prefix-xattrs", []byte{}, 0600),
+		tc.WithXattrs(map[string]string{
+			"user.short.long-value": longValue,
+			"user.short.shortvalue": "y",
+		}).File("/usr/lib/generated/xattrs/short-prefix-xattrs", []byte{}, 0600),
+		tc.Device("/dev/block0", fs.ModeDevice, 1, 1),
+		tc.Device("/dev/block1", fs.ModeDevice, 0, 0),
+		tc.Device("/dev/char0", fs.ModeCharDevice, 2, 2),
+		tc.Device("/dev/char1", fs.ModeCharDevice, 3, 3),
+		tc.Device("/dev/fifo0", fs.ModeNamedPipe, 0, 0),
+	)
+
+	writerTo = tartest.TarAll(
+		append(lotsOfFiles, writerTo)...,
+	)
+
+	path := filepath.Join(t.TempDir(), name+".erofs")
+	err := tartest.ConvertTarErofs(context.Background(), tartest.TarFromWriterTo(writerTo), path, "", mkfsArgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		f.Close()
-	})
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
 	return f
 }
 
