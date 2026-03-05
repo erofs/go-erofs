@@ -79,6 +79,12 @@ func EroFS(r io.ReaderAt) (fs.FS, error) {
 		return nil, fmt.Errorf("unsupported incompatible feature 0x%x: %w", unknownFeat, ErrNotImplemented)
 	}
 
+	// Error out filesystems with unsupported compressed inodes
+	if i.sb.FeatureIncompat&disk.FeatureIncompatLZ4_0Padding != 0 ||
+		i.sb.ComprAlgs != 0 {
+		return nil, fmt.Errorf("unsupported compressed filesystem: %w", ErrNotImplemented)
+	}
+
 	i.blkPool.New = func() any {
 		return &block{
 			buf: make([]byte, 1<<i.sb.BlkSizeBits),
