@@ -252,6 +252,7 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	case disk.LayoutFlatPlain:
 		// flat plain has no holes
 		addr = int64(int(fi.inodeData)+bn) << img.sb.BlkSizeBits
+		blockOffset = int(pos % int64(blockSize))
 		if bn == nblocks-1 {
 			blockEnd = int(fi.size - int64(bn)*int64(1<<img.sb.BlkSizeBits))
 		}
@@ -264,17 +265,21 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 
 			// Get the ooffset from the start of the block
 			blockOffset = int(addr & int64(blockSize-1))
-			// Calculate end of block using data offset + tail data size
+
+			// Move addr to start of block
+			addr = (addr & ^int64(blockSize-1))
+
+			// Move the offset within the block based on position within file
+			blockOffset += int(pos - int64(bn<<int(img.sb.BlkSizeBits)))
 			blockEnd = int(fi.size-int64(bn*blockSize)) + blockOffset
 
 			// Ensure the last block is not exceeded
 			if blockEnd > blockSize {
 				return nil, fmt.Errorf("inline data cross block boundary for nid %d: %w", fi.nid, ErrInvalid)
 			}
-			// Move the offset within the block based on position within file
-			blockOffset += int(pos - int64(bn<<int(img.sb.BlkSizeBits)))
 		} else {
 			addr = int64(int(fi.inodeData)+bn) << img.sb.BlkSizeBits
+			blockOffset = int(pos % int64(blockSize))
 		}
 	case disk.LayoutChunkBased:
 		// first 2 le bytes for format, second 2 bytes are reserved
@@ -311,12 +316,14 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		if bn == nblocks-1 {
 			blockEnd = int(fi.size - int64(bn)*int64(1<<img.sb.BlkSizeBits))
 		}
+		blockOffset = int(pos % int64(blockSize))
 
 		if rawAddr == -1 {
 			// Null address, return new zero filled block
 			return &block{
-				buf: make([]byte, 1<<img.sb.BlkSizeBits),
-				end: int32(blockEnd),
+				buf:    make([]byte, 1<<img.sb.BlkSizeBits),
+				offset: int32(blockOffset),
+				end:    int32(blockEnd),
 			}, nil
 		}
 
@@ -336,14 +343,13 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	}
 
 	b := img.getBlock()
-	if n, err := img.meta.ReadAt(b.buf[blockOffset:blockEnd], addr); err != nil {
-		return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.nid, err)
-	} else if n != (blockEnd - blockOffset) {
-		return nil, fmt.Errorf("failed to read full block for nid %d: %w", fi.nid, ErrInvalid)
-	}
 	b.offset = int32(blockOffset)
 	b.end = int32(blockEnd)
-
+	if n, err := img.meta.ReadAt(b.bytes(), addr+int64(blockOffset)); err != nil {
+		return nil, fmt.Errorf("failed to read block for nid %d: %w", fi.nid, err)
+	} else if n != blockEnd-blockOffset {
+		return nil, fmt.Errorf("failed to read full block for nid %d: %w, expected %d, actual %d", fi.nid, ErrInvalid, blockEnd-blockOffset, n)
+	}
 	return b, nil
 }
 
