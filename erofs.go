@@ -107,6 +107,13 @@ func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
 	// sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
 	i.deviceIDMask = uint16(roundupPowerOfTwo(uint32(i.sb.ExtraDevices)+1) - 1)
 
+	// Error out filesystems with unsupported compressed inodes
+	if i.sb.FeatureIncompat&disk.FeatureIncompatLZ4_0Padding != 0 ||
+		i.sb.ComprAlgs != 0 {
+		return nil, fmt.Errorf("unsupported compressed filesystem (FeatureIncompat=0x%x, ComprAlgs=0x%x): %w",
+			i.sb.FeatureIncompat, i.sb.ComprAlgs, ErrNotImplemented)
+	}
+
 	i.blkPool.New = func() any {
 		return &block{
 			buf: make([]byte, 1<<i.sb.BlkSizeBits),

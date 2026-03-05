@@ -4,11 +4,14 @@ const (
 	MagicNumber      = 0xe0f5e1e2
 	SuperBlockOffset = 1024
 
+	FeatureIncompatLZ4_0Padding         = 0x1
 	FeatureIncompatChunkedFile          = 0x4
 	FeatureIncompatDeviceTable          = 0x8
 	FeatureIncompatFragments            = 0x20
 	FeatureIncompatXattrPrefixes        = 0x40
-	FeatureIncompatAll           uint32 = FeatureIncompatChunkedFile | FeatureIncompatDeviceTable | FeatureIncompatFragments | FeatureIncompatXattrPrefixes
+	FeatureIncompatAll           uint32 = FeatureIncompatLZ4_0Padding |
+		FeatureIncompatChunkedFile | FeatureIncompatDeviceTable |
+		FeatureIncompatFragments | FeatureIncompatXattrPrefixes
 
 	SizeSuperBlock      = 128
 	SizeInodeCompact    = 32
