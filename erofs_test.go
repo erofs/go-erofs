@@ -99,12 +99,34 @@ func TestBasic(t *testing.T) {
 			checkDevice(t, efs, "/dev/fifo0", fs.ModeNamedPipe, 0)
 		})
 	}
+
+	// Compression format is unimplemented
+	for _, tc := range []struct {
+		name string
+		opts []createOpt
+	}{
+		{"lz4-4096", []createOpt{withCompression("lz4")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			copts := tc.opts
+			if hasXattrPrefix {
+				copts = append(copts, withXattrPrefix)
+			}
+			er, eopts := createTestFile(t, tc.name, copts...)
+			_, err := EroFS(er, eopts...)
+			if !errors.Is(err, ErrNotImplemented) {
+				t.Fatal(err)
+			}
+		})
+	}
+
 }
 
 type createOptions struct {
 	chunkSize   int
 	blobDev     bool
 	xattrPrefix bool
+	alg         string
 }
 
 type createOpt func(*createOptions)
@@ -121,6 +143,12 @@ func withBlobDev(o *createOptions) {
 
 func withXattrPrefix(o *createOptions) {
 	o.xattrPrefix = true
+}
+
+func withCompression(alg string) createOpt {
+	return func(o *createOptions) {
+		o.alg = alg
+	}
 }
 
 func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, []Opt) {
@@ -140,6 +168,10 @@ func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, 
 	if options.xattrPrefix {
 		mkfsArgs = append(mkfsArgs, "--xattr-prefix=user.short")
 		mkfsArgs = append(mkfsArgs, fmt.Sprintf("--xattr-prefix=%s", longPrefix))
+	}
+
+	if options.alg != "" {
+		mkfsArgs = append(mkfsArgs, "-z"+options.alg)
 	}
 
 	tc := tartest.TarContext{}.WithModTime(time.Now().UTC())
