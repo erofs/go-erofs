@@ -16,14 +16,14 @@ import (
 )
 
 func TestBasic(t *testing.T) {
-
+	minChunk := os.Getpagesize()
 	for _, tc := range []struct {
 		name     string
 		mkfsArgs []string
 	}{
 		{"default", []string{}},
-		{"chunk-4096", []string{"--chunksize=4096"}},
-		{"chunk-8192", []string{"--chunksize=8192"}},
+		{fmt.Sprintf("chunk-%d", minChunk), []string{fmt.Sprintf("--chunksize=%d", minChunk)}},
+		{fmt.Sprintf("chunk-%d", minChunk*2), []string{fmt.Sprintf("--chunksize=%d", minChunk*2)}},
 		// TODO: Add compressed layout
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -78,10 +78,10 @@ func TestBasic(t *testing.T) {
 				"user.short.long-value": longValue,
 				"user.short.shortvalue": "y",
 			})
-			checkDevice(t, efs, "/dev/block0", fs.ModeDevice, 0x00000101)
+			checkDevice(t, efs, "/dev/block0", fs.ModeDevice, 1)
 			checkDevice(t, efs, "/dev/block1", fs.ModeDevice, 0)
-			checkDevice(t, efs, "/dev/char0", fs.ModeCharDevice, 0x00000202)
-			checkDevice(t, efs, "/dev/char1", fs.ModeCharDevice, 0x00000303)
+			checkDevice(t, efs, "/dev/char0", fs.ModeCharDevice, 2)
+			checkDevice(t, efs, "/dev/char1", fs.ModeCharDevice, 3)
 			checkDevice(t, efs, "/dev/fifo0", fs.ModeNamedPipe, 0)
 		})
 	}
@@ -140,10 +140,10 @@ func createTestFile(t testing.TB, name string, mkfsArgs []string) *os.File {
 			"user.short.long-value": longValue,
 			"user.short.shortvalue": "y",
 		}).File("/usr/lib/generated/xattrs/short-prefix-xattrs", []byte{}, 0600),
-		tc.Device("/dev/block0", fs.ModeDevice, 1, 1),
+		tc.Device("/dev/block0", fs.ModeDevice, 0, 1),
 		tc.Device("/dev/block1", fs.ModeDevice, 0, 0),
-		tc.Device("/dev/char0", fs.ModeCharDevice, 2, 2),
-		tc.Device("/dev/char1", fs.ModeCharDevice, 3, 3),
+		tc.Device("/dev/char0", fs.ModeCharDevice, 0, 2),
+		tc.Device("/dev/char1", fs.ModeCharDevice, 0, 3),
 		tc.Device("/dev/fifo0", fs.ModeNamedPipe, 0, 0),
 	)
 
