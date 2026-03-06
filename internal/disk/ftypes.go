@@ -76,13 +76,3 @@ func EroFSModeToGoFileMode(mode uint16) fs.FileMode {
 
 	return m
 }
-
-func RdevFromMode(mode uint16, inodeData uint32) uint32 {
-	switch mode & StatTypeMask {
-	case StatTypeChrdev, StatTypeBlkdev, StatTypeFifo, StatTypeSock:
-		// inodeData field is device number for some file types
-		return inodeData
-	default:
-		return 0 // Not a device type
-	}
-}

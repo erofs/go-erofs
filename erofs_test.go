@@ -140,7 +140,7 @@ func checkFileBytes(t testing.TB, fsys fs.FS, name string, content []byte) {
 	}
 }
 
-func checkDevice(t testing.TB, fsys fs.FS, name string, ftype fs.FileMode, rdev uint32) {
+func checkDevice(t testing.TB, fsys fs.FS, name string, ftype fs.FileMode, rdev uint64) {
 	t.Helper()
 
 	f, err := fsys.Open(name)

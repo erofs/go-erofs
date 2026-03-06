@@ -38,7 +38,7 @@ type Stat struct {
 	Mode        fs.FileMode
 	Size        int64
 	InodeLayout uint8
-	Rdev        uint32
+	Rdev        uint64
 	Inode       int64
 	UID         uint32
 	GID         uint32
