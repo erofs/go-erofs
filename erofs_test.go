@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/erofs/go-erofs/internal/erofstest"
 	"github.com/erofs/go-erofs/internal/tartest"
 )
 
@@ -21,6 +22,11 @@ const (
 )
 
 func TestBasic(t *testing.T) {
+	hasXattrPrefix, err := erofstest.CheckMkfsVersion("1.9")
+	if err != nil {
+		t.Skipf("skipping: %v", err)
+	}
+
 	minChunk := os.Getpagesize()
 	for _, tc := range []struct {
 		name string
@@ -33,7 +39,11 @@ func TestBasic(t *testing.T) {
 		// TODO: Add compressed layout
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			er, eopts := createTestFile(t, tc.name, tc.opts...)
+			copts := tc.opts
+			if hasXattrPrefix {
+				copts = append(copts, withXattrPrefix)
+			}
+			er, eopts := createTestFile(t, tc.name, copts...)
 			efs, err := EroFS(er, eopts...)
 			if err != nil {
 				t.Fatal(err)
@@ -92,8 +102,9 @@ func TestBasic(t *testing.T) {
 }
 
 type createOptions struct {
-	chunkSize int
-	blobDev   bool
+	chunkSize   int
+	blobDev     bool
+	xattrPrefix bool
 }
 
 type createOpt func(*createOptions)
@@ -108,6 +119,10 @@ func withBlobDev(o *createOptions) {
 	o.blobDev = true
 }
 
+func withXattrPrefix(o *createOptions) {
+	o.xattrPrefix = true
+}
+
 func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, []Opt) {
 	t.Helper()
 
@@ -120,6 +135,11 @@ func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, 
 	}
 	if options.chunkSize != 0 {
 		mkfsArgs = append(mkfsArgs, fmt.Sprintf("--chunksize=%d", options.chunkSize))
+	}
+
+	if options.xattrPrefix {
+		mkfsArgs = append(mkfsArgs, "--xattr-prefix=user.short")
+		mkfsArgs = append(mkfsArgs, fmt.Sprintf("--xattr-prefix=%s", longPrefix))
 	}
 
 	tc := tartest.TarContext{}.WithModTime(time.Now().UTC())
