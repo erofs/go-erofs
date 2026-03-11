@@ -1,0 +1,210 @@
+diff --git a/include/erofs/err.h b/include/erofs/err.h
+index 59c8c9c..b493676 100644
+--- a/include/erofs/err.h
++++ b/include/erofs/err.h
+@@ -13,6 +13,7 @@ extern "C"
+ #endif
+
+ #include <errno.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <stdio.h>
+
+@@ -30,7 +31,7 @@ static inline const char *erofs_strerror(int err)
+
+ #define MAX_ERRNO (4095)
+ #define IS_ERR_VALUE(x)                                                        \
+-	((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
++	((uintptr_t)(void *)(x) >= (uintptr_t)-MAX_ERRNO)
+
+ static inline void *ERR_PTR(long error)
+ {
+@@ -39,12 +40,12 @@ static inline void *ERR_PTR(long error)
+
+ static inline int IS_ERR(const void *ptr)
+ {
+-	return IS_ERR_VALUE((unsigned long)ptr);
++	return IS_ERR_VALUE((uintptr_t)ptr);
+ }
+
+ static inline long PTR_ERR(const void *ptr)
+ {
+-	return (long) ptr;
++	return (intptr_t) ptr;
+ }
+
+ static inline void * ERR_CAST(const void *ptr)
+diff --git a/include/erofs/internal.h b/include/erofs/internal.h
+index e741f1c..8322073 100644
+--- a/include/erofs/internal.h
++++ b/include/erofs/internal.h
+@@ -12,6 +12,7 @@ extern "C"
+ {
+ #endif
+
++#include <stdint.h>
+ #include "list.h"
+ #include "err.h"
+
+@@ -344,7 +345,7 @@ static inline unsigned int erofs_inode_datalayout(unsigned int ifmt)
+
+ static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
+ {
+-	return (struct erofs_inode *)((unsigned long)inode->i_parent & ~1UL);
++	return (struct erofs_inode *)((uintptr_t)inode->i_parent & ~(uintptr_t)1);
+ }
+
+ #define IS_ROOT(x)	((x) == erofs_parent_inode(x))
+diff --git a/lib/compress_hints.c b/lib/compress_hints.c
+index 322ec97..3069b19 100644
+--- a/lib/compress_hints.c
++++ b/lib/compress_hints.c
+@@ -1,3 +1,6 @@
++#ifndef REG_NOMATCH
++#define REG_NOMATCH 1
++#endif
+ // SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+ /*
+  * Copyright (C), 2008-2021, OPPO Mobile Comm Corp., Ltd.
+diff --git a/lib/diskbuf.c b/lib/diskbuf.c
+index 0bf42da..73e919d 100644
+--- a/lib/diskbuf.c
++++ b/lib/diskbuf.c
+@@ -117,7 +117,11 @@ setupone:
+ 		erofs_atomic_set(&strm->count, 1);
+ 		if (fstat(strm->fd, &st))
+ 			return -errno;
+-		strm->alignsize = max_t(u32, st.st_blksize, getpagesize());
++#ifdef _WIN32
++		strm->alignsize = (u32)getpagesize();
++#else
++		strm->alignsize = max_t(u32, st.st_blksize, getpagesize());
++#endif
+ 	}
+ 	return 0;
+ }
+diff --git a/lib/exclude.c b/lib/exclude.c
+index 5f6107b..4e8a344 100644
+--- a/lib/exclude.c
++++ b/lib/exclude.c
+@@ -1,3 +1,6 @@
++#ifndef REG_NOMATCH
++#define REG_NOMATCH 1
++#endif
+ // SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+ /*
+  * Created by Li Guifu <bluce.lee@aliyun.com>
+diff --git a/lib/inode.c b/lib/inode.c
+index 4a214f9..d677ed8 100644
+--- a/lib/inode.c
++++ b/lib/inode.c
+@@ -1,3 +1,24 @@
++#ifdef _WIN32
++#ifndef S_IFLNK
++#define S_IFLNK 0xA000
++#endif
++#ifndef S_IFSOCK
++#define S_IFSOCK 0xC000
++#endif
++#ifndef DT_UNKNOWN
++#define DT_UNKNOWN 0
++#define DT_REG 8
++#define DT_DIR 4
++#define DT_CHR 2
++#define DT_BLK 6
++#define DT_FIFO 1
++#define DT_SOCK 12
++#define DT_LNK 10
++#endif
++#ifndef _POSIX_OPEN_MAX
++#define _POSIX_OPEN_MAX 20
++#endif
++#endif /* _WIN32 */
+ // SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+ /*
+  * Copyright (C) 2018-2019 HUAWEI, Inc.
+@@ -6,6 +25,7 @@
+  * with heavy changes by Gao Xiang <xiang@kernel.org>
+  */
+ #define _GNU_SOURCE
++#include <stdint.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -2095,13 +2115,13 @@ static int erofs_mkfs_handle_inode(const struct erofs_mkfs_btctx *ctx,
+
+ static bool erofs_inode_visited(struct erofs_inode *inode)
+ {
+-	return (unsigned long)inode->i_parent & 1UL;
++	return (uintptr_t)inode->i_parent & (uintptr_t)1;
+ }
+
+ static void erofs_mark_parent_inode(struct erofs_inode *inode,
+ 				    struct erofs_inode *dir)
+ {
+-	inode->i_parent = (void *)((unsigned long)dir | 1);
++	inode->i_parent = (void *)((uintptr_t)dir | (uintptr_t)1);
+ }
+
+ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
+diff --git a/lib/io.c b/lib/io.c
+index 0c5eb2c..1a14523 100644
+--- a/lib/io.c
++++ b/lib/io.c
+@@ -359,7 +359,11 @@ repeat:
+ 				return -errno;
+ 			}
+ 		}
+-		sbi->devblksz = st.st_blksize;
++#ifdef _WIN32
++		sbi->devblksz = 4096;
++#else
++		sbi->devblksz = st.st_blksize;
++#endif
+ 		break;
+ 	default:
+ 		erofs_err("bad file type (%s, %o).", dev, st.st_mode);
+diff --git a/lib/rebuild.c b/lib/rebuild.c
+index f89a17c..f04b456 100644
+--- a/lib/rebuild.c
++++ b/lib/rebuild.c
+@@ -1,3 +1,11 @@
++#ifdef _WIN32
++#ifndef S_IFLNK
++#define S_IFLNK 0xA000
++#endif
++#ifndef S_IFSOCK
++#define S_IFSOCK 0xC000
++#endif
++#endif /* _WIN32 */
+ // SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+ #define _GNU_SOURCE
+ #include <unistd.h>
+diff --git a/lib/tar.c b/lib/tar.c
+index 178f843..31df7e0 100644
+--- a/lib/tar.c
++++ b/lib/tar.c
+@@ -1,3 +1,11 @@
++#ifdef _WIN32
++#ifndef S_IFLNK
++#define S_IFLNK 0xA000
++#endif
++#ifndef S_IFSOCK
++#define S_IFSOCK 0xC000
++#endif
++#endif /* _WIN32 */
+ // SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+ #include <unistd.h>
+ #include <stdlib.h>
+diff --git a/lib/xattr.c b/lib/xattr.c
+index d8c7bff..f611d72 100644
+--- a/lib/xattr.c
++++ b/lib/xattr.c
+@@ -1,3 +1,7 @@
++#include <stdint.h>
++#ifdef _WIN32
++typedef unsigned int uint;
++#endif
+ // SPDX-License-Identifier: GPL-2.0+ OR Apache-2.0
+ /*
+  * Copyright (C) 2019 Li Guifu <blucerlee@gmail.com>

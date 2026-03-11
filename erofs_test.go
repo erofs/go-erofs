@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -129,6 +130,9 @@ func TestBasic(t *testing.T) {
 		{"lz4-4096", []createOpt{withCompression("lz4")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if runtime.GOOS == "windows" {
+				t.Skip("mkfs.erofs compression is not included on Windows")
+			}
 			copts := tc.opts
 			if hasXattrPrefix {
 				copts = append(copts, withXattrPrefix)
