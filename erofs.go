@@ -451,10 +451,6 @@ func (img *image) putBlock(b *block) {
 	img.blkPool.Put(b)
 }
 
-func (i *image) dirEntry(nid uint64, name string) (uint64, fs.FileMode, error) {
-	return 0, 0, errors.New("direntry: not implemented")
-}
-
 func (i *image) Open(name string) (fs.File, error) {
 	var err error
 	original := name
@@ -508,8 +504,8 @@ func (i *image) Open(name string) (fs.File, error) {
 		var found bool
 		for _, e := range entries {
 			if e.Name() == basename {
-				nid = uint64(e.(*direntry).file.nid)
-				ftype = e.(*direntry).file.ftype & fs.ModeType
+				nid = e.(*direntry).nid
+				ftype = e.(*direntry).ftype & fs.ModeType
 				found = true
 			}
 		}
@@ -641,8 +637,8 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 				InodeLayout: layout,
 				Inode:       int64(b.nid),
 				Rdev:        disk.RdevFromMode(inode.Mode, inode.InodeData),
-				UID:         uint32(inode.UID),
-				GID:         uint32(inode.GID),
+				UID:         inode.UID,
+				GID:         inode.GID,
 				Nlink:       int(inode.Nlink),
 				Mtime:       inode.Mtime,
 				MtimeNs:     inode.MtimeNs,
@@ -655,13 +651,14 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 		b.info.xsize = int(xcnt-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
 	}
 
-	if infoOnly && b.info.xsize > 0 {
+	switch {
+	case infoOnly && b.info.xsize > 0:
 		if err = setXattrs(b, addr, blk); err != nil {
 			return nil, err
 		}
-	} else if infoOnly || b.info.inodeLayout == disk.LayoutFlatPlain || b.info.size == 0 || blk.end != blkSize {
+	case infoOnly || b.info.inodeLayout == disk.LayoutFlatPlain || b.info.size == 0 || blk.end != blkSize:
 		b.img.putBlock(blk)
-	} else {
+	default:
 		// If the inode has trailing data used later, cache it
 		b.info.cached = blk
 	}
@@ -730,10 +727,10 @@ func (d *direntry) Info() (fs.FileInfo, error) {
 type dir struct {
 	file
 
-	//bn is the current block to read from (relative to file start)
+	// bn is the current block to read from (relative to file start)
 	bn int
 
-	//consumed is how many have been returned in the current block
+	// consumed is how many have been returned in the current block
 	consumed uint16
 }
 
@@ -788,7 +785,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 
 			if i >= d.consumed && name != "." && name != ".." {
 				b := file{
-					img:   d.file.img,
+					img:   d.img,
 					name:  name,
 					nid:   dirents[0].Nid,
 					ftype: disk.EroFSFtypeToFileMode(dirents[0].FileType),

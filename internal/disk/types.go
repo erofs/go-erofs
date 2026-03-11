@@ -98,7 +98,7 @@ type Dirent struct {
 
 // XattrHeader is the header after an inode containing xattr information
 //
-// Original defintion:
+// Original definition:
 // inline xattrs (n == i_xattr_icount):
 // erofs_xattr_ibody_header(1) + (n - 1) * 4 bytes
 //
