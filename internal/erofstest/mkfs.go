@@ -77,5 +77,5 @@ func mkfsVersion() (string, error) {
 	if len(fields) < 3 {
 		return "", fmt.Errorf("unexpected mkfs.erofs version output: %q", line)
 	}
-	return fields[len(fields)-1], nil
+	return strings.TrimPrefix(fields[len(fields)-1], "v"), nil
 }
