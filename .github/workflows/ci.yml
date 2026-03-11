@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: "1.25"
+          cache: false
+      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: v2.1
+
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Install erofs-utils build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config libz-dev liblz4-dev uuid-dev
+
+      - name: Install erofs-utils build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake libtool pkg-config lz4
+
+      - name: Build and install erofs-utils
+        run: |
+          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/v1.9.1.tar.gz | tar -xzf -
+          cd erofs-utils-1.9.1
+          ./autogen.sh
+          ./configure --enable-lz4
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          sudo make install
+          mkfs.erofs --version
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -v ./...
