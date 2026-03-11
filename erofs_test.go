@@ -229,11 +229,11 @@ func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, 
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { bf.Close() })
+		t.Cleanup(func() { _ = bf.Close() })
 
 		eOpts = append(eOpts, WithExtraDevices(bf))
 	}
-	t.Cleanup(func() { f.Close() })
+	t.Cleanup(func() { _ = f.Close() })
 	return f, eOpts
 }
 
@@ -245,7 +245,7 @@ func checkFileString(t testing.TB, fsys fs.FS, name, content string) {
 		t.Error(err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	b, err := io.ReadAll(f)
 	if err != nil {
@@ -267,7 +267,7 @@ func checkFileBytes(t testing.TB, fsys fs.FS, name string, content []byte) {
 		t.Error(err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	b, err := io.ReadAll(f)
 	if err != nil {
@@ -276,11 +276,12 @@ func checkFileBytes(t testing.TB, fsys fs.FS, name string, content []byte) {
 	}
 
 	if !bytes.Equal(b, content) {
-		if len(b) != len(content) {
+		switch {
+		case len(b) != len(content):
 			t.Logf("Unexpected content in %s\n\tActual Len: %d\n\tExpected Len: %d", name, len(b), len(content))
-		} else if len(b) < 8192 {
+		case len(b) < 8192:
 			t.Logf("Unexpected content in %s\n\tActual:   %x\n\tExpected: %x", name, b, content)
-		} else {
+		default:
 			t.Logf("Unexpected content in %s\n\tActual:   %x...%x\n\tExpected: %x...%x", name, b[:4096], b[len(b)-4096:], content[:4096], content[len(content)-4096:])
 		}
 		t.Fail()
@@ -295,7 +296,7 @@ func checkDevice(t testing.TB, fsys fs.FS, name string, ftype fs.FileMode, rdev 
 		t.Error(err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {

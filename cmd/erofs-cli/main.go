@@ -18,22 +18,28 @@ func main() {
 	flag.StringVar(&path, "img", "", "Path to erofs image")
 	flag.Parse()
 
-	f, err := os.Open(path)
-	if err != nil {
+	if err := run(path); err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+}
+
+func run(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
 
 	img, err := erofs.EroFS(f)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	fmt.Printf("Found valid image...\n")
 
 	err = fs.WalkDir(img, "/", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
-			return fmt.Errorf("error visting %s: %w", path, err)
+			return fmt.Errorf("error visiting %s: %w", path, err)
 		}
 		fmt.Printf("visited: %q\n", path)
 		fmt.Printf("\tName: %q\n", entry.Name())
@@ -61,7 +67,5 @@ func main() {
 		}
 		return nil
 	})
-	if err != nil {
-		log.Fatal(err)
-	}
+	return err
 }
