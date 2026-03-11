@@ -1,0 +1,49 @@
+diff --git a/lib/tar.c b/lib/tar.c
+--- a/lib/tar.c
++++ b/lib/tar.c
+@@ -12,6 +12,7 @@
+ #ifdef _WIN32
+ #include <fcntl.h>
+ #include <io.h>
++#include <windows.h>
+ #endif
+ #include "erofs/print.h"
+ #include "erofs/diskbuf.h"
+@@ -88,6 +89,23 @@
+ 	s64 fsz;
+
+ #ifdef _WIN32
++	/* On Windows, lseek() on pipes misleadingly "succeeds" - it returns
++	 * the current pipe buffer size for SEEK_END and silently no-ops for
++	 * SEEK_CUR/SEEK_SET.  This causes erofs_iostream_lskip() to use
++	 * lseek-based skipping, which does not actually advance the read
++	 * position, silently corrupting the tar stream parse.
++	 *
++	 * Detect pipes via GetFileType() and force the non-seekable path. */
++	bool is_pipe = false;
++	{
++		HANDLE h = (HANDLE)_get_osfhandle(fd);
++		if (h != INVALID_HANDLE_VALUE &&
++		    GetFileType(h) == FILE_TYPE_PIPE)
++			is_pipe = true;
++	}
++#endif
++
++#ifdef _WIN32
+ 	/* On Windows, ensure stdin is in blocking binary mode */
+ 	_setmode(fd, _O_BINARY);
+ #endif
+@@ -135,6 +153,13 @@
+ 	} else {
+ 		ios->vf.fd = fd;
+ 		fsz = lseek(fd, 0, SEEK_END);
++#ifdef _WIN32
++		/* If this fd is a pipe, ignore the lseek result entirely.
++		 * Pipes are not seekable; treat them the same as Unix does
++		 * (lseek returns -1, so fsz <= 0 path). */
++		if (is_pipe)
++			fsz = -1;
++#endif
+ 		if (fsz <= 0) {
+ 			ios->feof = !fsz;
+ 			ios->sz = 0;

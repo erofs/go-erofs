@@ -2,12 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci-test]
   pull_request:
     branches: [main]
 
 permissions:
   contents: read
+
+env:
+  EROFS_UTILS_VERSION: v1.9.1
 
 jobs:
   lint:
@@ -50,16 +53,125 @@ jobs:
 
       - name: Build and install erofs-utils
         run: |
-          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/v1.9.1.tar.gz | tar -xzf -
-          cd erofs-utils-1.9.1
+          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz | tar -xzf -
+          cd erofs-utils-${EROFS_UTILS_VERSION#v}
+          for p in "${GITHUB_WORKSPACE}"/.github/workflows/patches/erofs-utils/*.patch; do
+            patch -p1 < "$p"
+          done
           ./autogen.sh
           ./configure --enable-lz4
           make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
           sudo make install
-          mkfs.erofs --version
+          mkfs.erofs -V
 
       - name: Build
         run: go build ./...
 
       - name: Test
+        run: go test -v ./...
+
+  cross-compile-mkfs-windows:
+    name: Cross-compile mkfs.erofs for Windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install MinGW-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config mingw-w64
+
+      - name: Cross-compile lz4 for Windows
+        env:
+          MINGW_HOST: x86_64-w64-mingw32
+        run: |
+          curl -L https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz | tar -xzf -
+          cd lz4-1.10.0/lib
+          make -j"$(nproc)" \
+            CC=${MINGW_HOST}-gcc \
+            AR=${MINGW_HOST}-ar \
+            WINDRES=${MINGW_HOST}-windres \
+            TARGET_OS=Windows \
+            BUILD_STATIC=yes \
+            BUILD_SHARED=no \
+            CFLAGS="-O3 -DXXH_NAMESPACE=LZ4_"
+          sudo make PREFIX=/usr/${MINGW_HOST} install
+
+      - name: Cross-compile erofs-utils for Windows
+        env:
+          MINGW_HOST: x86_64-w64-mingw32
+        run: |
+          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz | tar -xzf -
+          cd erofs-utils-${EROFS_UTILS_VERSION#v}
+
+          # Install compat headers for MinGW
+          sudo cp -r "${GITHUB_WORKSPACE}/.github/workflows/mingw-compat-headers"/* /usr/${MINGW_HOST}/include/
+
+          # Apply Windows compatibility patches
+          for p in "${GITHUB_WORKSPACE}"/.github/workflows/patches/erofs-utils/*.patch; do
+            patch -p1 < "$p"
+          done
+
+          ./autogen.sh
+          PKG_CONFIG_PATH=/usr/${MINGW_HOST}/lib/pkgconfig \
+          ./configure \
+            --host=${MINGW_HOST} \
+            --disable-shared \
+            --enable-lz4 \
+            --without-zlib \
+            --disable-lzma \
+            --without-libzstd \
+            --without-selinux \
+            --without-uuid \
+            --without-openssl \
+            --disable-fuse \
+            --disable-debug \
+            --disable-dependency-tracking \
+            CFLAGS="-O2 -g -D_FILE_OFFSET_BITS=64" \
+            LDFLAGS="-Wl,-Bstatic -static-libgcc -L/usr/${MINGW_HOST}/lib" \
+            liblz4_LIBS="/usr/${MINGW_HOST}/lib/liblz4.a"
+
+          make -j"$(nproc)" -C lib CPPFLAGS="-include posix_compat.h"
+          make -j"$(nproc)" -C mkfs CPPFLAGS="-include posix_compat.h" LIBS="-llz4"
+
+          ${MINGW_HOST}-strip mkfs/mkfs.erofs.exe
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: mkfs-erofs-windows
+          path: erofs-utils-*/mkfs/mkfs.erofs.exe
+
+  test-windows:
+    name: Build & Test (windows-latest)
+    runs-on: windows-latest
+    needs: cross-compile-mkfs-windows
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: mkfs-erofs-windows
+
+      - name: Install mkfs.erofs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\bin"
+          Copy-Item erofs-utils-*/mkfs/mkfs.erofs.exe "$env:USERPROFILE\bin\"
+          "$env:USERPROFILE\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Verify mkfs.erofs
+        shell: bash
+        run: mkfs.erofs -V
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          # mkfs.erofs uses TMPDIR for temporary files; Windows doesn't set it
+          TMPDIR: ${{ runner.temp }}
         run: go test -v ./...

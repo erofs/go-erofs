@@ -1,0 +1,27 @@
+diff --git a/lib/tar.c b/lib/tar.c
+index 72c12ed..8e9a1e5 100644
+--- a/lib/tar.c
++++ b/lib/tar.c
+@@ -7,6 +7,10 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#endif
+ #include "erofs/print.h"
+ #include "erofs/diskbuf.h"
+ #include "erofs/inode.h"
+@@ -71,6 +75,11 @@ int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder)
+ {
+ 	s64 fsz;
+ 
++#ifdef _WIN32
++	/* On Windows, ensure stdin is in blocking binary mode */
++	_setmode(fd, _O_BINARY);
++#endif
++
+ 	ios->feof = false;
+ 	ios->tail = ios->head = 0;
+ 	ios->decoder = decoder;

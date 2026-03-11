@@ -1,0 +1,14 @@
+diff --git a/lib/gzran.c b/lib/gzran.c
+--- a/lib/gzran.c
++++ b/lib/gzran.c
+@@ -5,8 +5,10 @@
+ #include "erofs/list.h"
+ #include "erofs/err.h"
+ #include "liberofs_gzran.h"
+ #include <stdlib.h>
++#ifdef HAVE_ZLIB
+ #include <zlib.h>
++#endif
+
+ #ifdef HAVE_ZLIB
+ struct erofs_gzran_cutpoint {
