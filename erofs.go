@@ -2,13 +2,14 @@ package erofs
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
-	"path/filepath"
+	"path"
+	"slices"
 	"sync"
 	"time"
 
@@ -451,55 +452,75 @@ func (img *image) putBlock(b *block) {
 	img.blkPool.Put(b)
 }
 
-func (i *image) Open(name string) (fs.File, error) {
-	var err error
-	original := name
-	if filepath.IsAbs(name) {
-		name, err = filepath.Rel("/", name)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		name = filepath.Clean(name)
+const maxSymlinks = 255
+
+// readLink reads the symlink target for the given nid.
+func (i *image) readLink(nid uint64, name string) (string, error) {
+	f := &file{img: i, name: name, nid: nid, ftype: fs.ModeSymlink}
+	fi, err := f.readInfo(false)
+	if err != nil {
+		return "", err
 	}
+	buf := make([]byte, fi.size)
+	if fi.size > 0 {
+		if _, err = f.Read(buf); err != nil && err != io.EOF {
+			return "", err
+		}
+	}
+	return string(buf), nil
+}
+
+// resolve cleans the path and walks directory entries to find the target inode.
+// When follow is true, symlinks are followed (including the final component).
+// When follow is false, the final component is not followed (for Lstat/ReadLink).
+// Intermediate symlinks are always followed.
+func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.FileMode, basename string, err error) {
+	original := name
+	if path.IsAbs(name) {
+		name = name[1:]
+	}
+	name = path.Clean(name)
 	if name == "." {
 		name = ""
 	}
 
-	nid := uint64(i.sb.RootNid)
-	ftype := fs.ModeDir
+	nid = uint64(i.sb.RootNid)
+	ftype = fs.ModeDir
 
-	parent := "/"
-	basename := name
+	// curPath tracks the full resolved path of the current directory
+	// so that relative symlink targets can be resolved correctly.
+	linksFollowed := 0
+	curPath := ""
+	basename = name
 	for name != "" {
 		var sep int
-		for sep < len(name) && !os.IsPathSeparator(name[sep]) {
+		for sep < len(name) && name[sep] != '/' {
 			sep++
 		}
+		var rest string
 		if sep < len(name) {
 			basename = name[:sep]
-			name = name[sep+1:]
+			rest = name[sep+1:]
 		} else {
 			basename = name
-			name = ""
+			rest = ""
 		}
 
 		if ftype != fs.ModeDir {
-			// TODO: Path error
-			return nil, errors.New("not a directory")
+			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: errors.New("not a directory")}
 		}
-		dir := &dir{
+		d := &dir{
 			file: file{
 				img:   i,
-				name:  parent,
+				name:  basename,
 				nid:   nid,
 				ftype: ftype,
 			},
 		}
 		// TODO: Lookup in directory instead of reading all
-		entries, err := dir.ReadDir(-1)
+		entries, err := d.ReadDir(-1)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read dir: %w", err)
+			return 0, 0, "", fmt.Errorf("failed to read dir: %w", err)
 		}
 		var found bool
 		for _, e := range entries {
@@ -510,26 +531,139 @@ func (i *image) Open(name string) (fs.File, error) {
 			}
 		}
 		if !found {
-			return nil, fmt.Errorf("%s not found: %w", original, fs.ErrNotExist)
+			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: fs.ErrNotExist}
 		}
-		parent = basename
+
+		// Follow symlinks for intermediate components always,
+		// and for the final component only when follow is true.
+		isFinal := rest == ""
+		if ftype&fs.ModeSymlink != 0 && (follow || !isFinal) {
+			linksFollowed++
+			if linksFollowed > maxSymlinks {
+				return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: errors.New("too many symlinks")}
+			}
+			target, err := i.readLink(nid, basename)
+			if err != nil {
+				return 0, 0, "", err
+			}
+			// Prepend the symlink target to the remaining path
+			if rest != "" {
+				target = target + "/" + rest
+			}
+			// Resolve relative to the parent directory's full path
+			if !path.IsAbs(target) {
+				target = curPath + "/" + target
+			}
+			// Clean and re-resolve from root
+			target = path.Clean(target)
+			if len(target) > 0 && target[0] == '/' {
+				target = target[1:]
+			}
+			nid = uint64(i.sb.RootNid)
+			ftype = fs.ModeDir
+			curPath = ""
+			name = target
+			if name == "." {
+				name = ""
+			}
+			basename = name
+			continue
+		}
+
+		if curPath == "" {
+			curPath = basename
+		} else {
+			curPath = curPath + "/" + basename
+		}
+		name = rest
 	}
 
 	if basename == "" {
 		basename = original
 	}
+	return nid, ftype, basename, nil
+}
 
-	b := file{
-		img:   i,
-		name:  basename,
-		nid:   nid,
-		ftype: ftype,
+func (i *image) Open(name string) (fs.File, error) {
+	nid, ftype, basename, err := i.resolve("open", name, true)
+	if err != nil {
+		return nil, err
 	}
+	b := file{img: i, name: basename, nid: nid, ftype: ftype}
 	if ftype.IsDir() {
 		return &dir{file: b}, nil
 	}
-
 	return &b, nil
+}
+
+func (i *image) Stat(name string) (fs.FileInfo, error) {
+	nid, ftype, basename, err := i.resolve("stat", name, true)
+	if err != nil {
+		return nil, err
+	}
+	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
+	return f.readInfo(true)
+}
+
+func (i *image) ReadFile(name string) ([]byte, error) {
+	nid, ftype, basename, err := i.resolve("readfile", name, true)
+	if err != nil {
+		return nil, err
+	}
+	if ftype.IsDir() {
+		return nil, &fs.PathError{Op: "read", Path: name, Err: errors.New("is a directory")}
+	}
+	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
+	fi, err := f.readInfo(false)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, fi.size)
+	if fi.size > 0 {
+		if _, err = f.Read(buf); err != nil && err != io.EOF {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+func (i *image) ReadDir(name string) ([]fs.DirEntry, error) {
+	nid, ftype, basename, err := i.resolve("readdir", name, true)
+	if err != nil {
+		return nil, err
+	}
+	if !ftype.IsDir() {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: errors.New("not a directory")}
+	}
+	d := &dir{file: file{img: i, name: basename, nid: nid, ftype: ftype}}
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int {
+		return cmp.Compare(a.Name(), b.Name())
+	})
+	return entries, nil
+}
+
+func (i *image) ReadLink(name string) (string, error) {
+	nid, ftype, basename, err := i.resolve("readlink", name, false)
+	if err != nil {
+		return "", err
+	}
+	if ftype&fs.ModeSymlink == 0 {
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: errors.New("not a symlink")}
+	}
+	return i.readLink(nid, basename)
+}
+
+func (i *image) Lstat(name string) (fs.FileInfo, error) {
+	nid, ftype, basename, err := i.resolve("lstat", name, false)
+	if err != nil {
+		return nil, err
+	}
+	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
+	return f.readInfo(true)
 }
 
 type file struct {

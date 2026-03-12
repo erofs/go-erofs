@@ -97,6 +97,27 @@ func TestBasic(t *testing.T) {
 			checkDevice(t, efs, "/dev/char0", fs.ModeCharDevice, 2)
 			checkDevice(t, efs, "/dev/char1", fs.ModeCharDevice, 3)
 			checkDevice(t, efs, "/dev/fifo0", fs.ModeNamedPipe, 0)
+			checkReadLink(t, efs, "/usr/lib/testdir/link-to-root", "../../../in-root.txt")
+			checkReadLink(t, efs, "/usr/lib/testdir/abs-link", "/in-root.txt")
+			checkLstat(t, efs, "/usr/lib/testdir/link-to-root", fs.ModeSymlink)
+			checkLstat(t, efs, "/in-root.txt", 0)
+			checkLstat(t, efs, "/usr/lib/testdir", fs.ModeDir)
+			checkReadLinkNotSymlink(t, efs, "/in-root.txt")
+			checkReadFile(t, efs, "/in-root.txt", "root file content\n")
+			checkReadFileDir(t, efs, "/usr/lib/testdir")
+			checkReadDirSorted(t, efs, "/dev")
+			// Verify Open/ReadFile/Stat follow symlinks
+			checkFileString(t, efs, "/usr/lib/testdir/link-to-root", "root file content\n")
+			checkFileString(t, efs, "/usr/lib/testdir/abs-link", "root file content\n")
+			checkReadFile(t, efs, "/usr/lib/testdir/link-to-root", "root file content\n")
+			// Verify traversal through a symlinked directory
+			checkFileString(t, efs, "/links/dir-link/emptyfile", "")
+			// Double directory symlink: dir-link2 -> dir-link -> /usr/lib/testdir
+			checkFileString(t, efs, "/links/dir-link2/emptyfile", "")
+			// Double file symlink: double-file-link -> abs-link -> /in-root.txt
+			checkFileString(t, efs, "/links/double-file-link", "root file content\n")
+			// File symlink through directory symlink: file-via-dirs -> dir-link -> /usr/lib/testdir, then /emptyfile
+			checkFileString(t, efs, "/links/file-via-dirs/abs-link", "root file content\n")
 		})
 	}
 }
@@ -197,6 +218,12 @@ func createTestFile(t testing.TB, name string, opts ...createOpt) (io.ReaderAt, 
 		tc.Device("/dev/char0", fs.ModeCharDevice, 0, 2),
 		tc.Device("/dev/char1", fs.ModeCharDevice, 0, 3),
 		tc.Device("/dev/fifo0", fs.ModeNamedPipe, 0, 0),
+		tc.Symlink("../../../in-root.txt", "/usr/lib/testdir/link-to-root"),
+		tc.Symlink("/in-root.txt", "/usr/lib/testdir/abs-link"),
+		tc.Symlink("/usr/lib/testdir", "/links/dir-link"),
+		tc.Symlink("/links/dir-link", "/links/dir-link2"),
+		tc.Symlink("/usr/lib/testdir/abs-link", "/links/double-file-link"),
+		tc.Symlink("/links/dir-link", "/links/file-via-dirs"),
 	)
 
 	writerTo = tartest.TarAll(
@@ -336,6 +363,94 @@ func checkNotExists(t testing.TB, fsys fs.FS, name string) {
 		t.Errorf("expected error opening %s", name)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("expected not exist error opening %s, got %v", name, err)
+	}
+}
+
+type readLinkFS interface {
+	ReadLink(name string) (string, error)
+	Lstat(name string) (fs.FileInfo, error)
+}
+
+func checkReadLink(t testing.TB, fsys fs.FS, name, target string) {
+	t.Helper()
+	rlfs, ok := fsys.(readLinkFS)
+	if !ok {
+		t.Errorf("FS does not implement ReadLink")
+		return
+	}
+	got, err := rlfs.ReadLink(name)
+	if err != nil {
+		t.Errorf("ReadLink(%s): %v", name, err)
+		return
+	}
+	if got != target {
+		t.Errorf("ReadLink(%s) = %q, want %q", name, got, target)
+	}
+}
+
+func checkLstat(t testing.TB, fsys fs.FS, name string, wantType fs.FileMode) {
+	t.Helper()
+	rlfs, ok := fsys.(readLinkFS)
+	if !ok {
+		t.Errorf("FS does not implement Lstat")
+		return
+	}
+	fi, err := rlfs.Lstat(name)
+	if err != nil {
+		t.Errorf("Lstat(%s): %v", name, err)
+		return
+	}
+	gotType := fi.Mode() & fs.ModeType
+	if gotType != wantType {
+		t.Errorf("Lstat(%s) type = %v, want %v", name, gotType, wantType)
+	}
+}
+
+func checkReadLinkNotSymlink(t testing.TB, fsys fs.FS, name string) {
+	t.Helper()
+	rlfs, ok := fsys.(readLinkFS)
+	if !ok {
+		t.Errorf("FS does not implement ReadLink")
+		return
+	}
+	_, err := rlfs.ReadLink(name)
+	if err == nil {
+		t.Errorf("ReadLink(%s) should fail on non-symlink", name)
+	}
+}
+
+func checkReadFile(t testing.TB, fsys fs.FS, name, content string) {
+	t.Helper()
+	got, err := fs.ReadFile(fsys, name)
+	if err != nil {
+		t.Errorf("ReadFile(%s): %v", name, err)
+		return
+	}
+	if string(got) != content {
+		t.Errorf("ReadFile(%s) = %q, want %q", name, got, content)
+	}
+}
+
+func checkReadFileDir(t testing.TB, fsys fs.FS, name string) {
+	t.Helper()
+	_, err := fs.ReadFile(fsys, name)
+	if err == nil {
+		t.Errorf("ReadFile(%s) should fail on directory", name)
+	}
+}
+
+func checkReadDirSorted(t testing.TB, fsys fs.FS, name string) {
+	t.Helper()
+	entries, err := fs.ReadDir(fsys, name)
+	if err != nil {
+		t.Errorf("ReadDir(%s): %v", name, err)
+		return
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i-1].Name() >= entries[i].Name() {
+			t.Errorf("ReadDir(%s) not sorted: %q >= %q at index %d", name, entries[i-1].Name(), entries[i].Name(), i)
+			return
+		}
 	}
 }
 
