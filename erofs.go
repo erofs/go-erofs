@@ -84,8 +84,7 @@ func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
 	}
 
 	i := image{
-		meta:         r,
-		extraDevices: o.extraDevices,
+		meta: r,
 	}
 	if err = decodeSuperBlock(superBlock, &i.sb); err != nil {
 		return nil, err
@@ -99,13 +98,40 @@ func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
 	if unknownFeat != 0 {
 		return nil, fmt.Errorf("unsupported incompatible feature 0x%x: %w", unknownFeat, ErrNotImplemented)
 	}
-	if int(i.sb.ExtraDevices) != len(o.extraDevices) {
-		// TODO: Provide options for skipping extra devices and error out later?
-		return nil, fmt.Errorf("invalid super block: extra devices count %d does not match provided %d", i.sb.ExtraDevices, len(o.extraDevices))
+	ondiskExtraDevices := uint32(0)
+	if i.sb.FeatureIncompat&disk.FeatureIncompatDeviceTable != 0 {
+		ondiskExtraDevices = uint32(i.sb.ExtraDevices)
+		// Calculate device_id_mask
+		// sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
+		i.deviceIDMask = uint16(roundupPowerOfTwo(uint32(i.sb.ExtraDevices)+1) - 1)
 	}
-	// Calculate device_id_mask
-	// sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
-	i.deviceIDMask = uint16(roundupPowerOfTwo(uint32(i.sb.ExtraDevices)+1) - 1)
+
+	if int(ondiskExtraDevices) != len(o.extraDevices) {
+		// TODO: Provide options for skipping extra devices and error out later?
+		return nil, fmt.Errorf("invalid super block: extra devices count %d does not match provided %d", ondiskExtraDevices, len(o.extraDevices))
+	}
+
+	// Parse the device table if extra devices exist
+	if ondiskExtraDevices > 0 {
+		devTableOffset := int64(i.sb.DevtSlotOff) * disk.SizeDeviceSlot
+		i.devices = make([]deviceInfo, int(ondiskExtraDevices))
+		for idx := range i.devices {
+			var slotBuf [disk.SizeDeviceSlot]byte
+			offset := devTableOffset + int64(idx)*disk.SizeDeviceSlot
+			if _, err := r.ReadAt(slotBuf[:], offset); err != nil {
+				return nil, fmt.Errorf("failed to read device slot %d at offset %d: %w", idx, offset, err)
+			}
+			var slot disk.DeviceSlot
+			if _, err := binary.Decode(slotBuf[:], binary.LittleEndian, &slot); err != nil {
+				return nil, fmt.Errorf("failed to decode device slot %d: %w", idx, err)
+			}
+			i.devices[idx] = deviceInfo{
+				device:        o.extraDevices[idx],
+				mappedBlkAddr: slot.MappedBlkAddr,
+				blocks:        slot.Blocks,
+			}
+		}
+	}
 
 	// Error out filesystems with unsupported compressed inodes
 	if i.sb.FeatureIncompat&disk.FeatureIncompatLZ4_0Padding != 0 ||
@@ -135,11 +161,18 @@ func roundupPowerOfTwo(v uint32) uint32 {
 	return v
 }
 
+// deviceInfo holds the parsed mapped address range for a device table entry.
+type deviceInfo struct {
+	device        io.ReaderAt
+	mappedBlkAddr uint32 // starting mapped block address
+	blocks        uint32 // total block count for this device
+}
+
 type image struct {
 	sb disk.SuperBlock
 
 	meta         io.ReaderAt
-	extraDevices []io.ReaderAt
+	devices      []deviceInfo // parsed device table entries
 	deviceIDMask uint16
 	blkPool      sync.Pool
 	longPrefixes []string // cached long xattr prefixes
@@ -150,6 +183,34 @@ type image struct {
 // start physical offset of the separate metadata zone
 func (img *image) metaStartPos() int64 {
 	return int64(img.sb.MetaBlkAddr) << int64(img.sb.BlkSizeBits)
+}
+
+// mapDev resolves map->m_bdev and map->m_pa mapping for go-erofs.
+// It works similarly to erofs_map_dev in the linux kernel.
+func (img *image) mapDev(deviceID uint16, pa int64) (io.ReaderAt, int64, error) {
+	if deviceID > 0 {
+		if int(deviceID) > len(img.devices) {
+			return nil, 0, fmt.Errorf("invalid device id %d", deviceID)
+		}
+		return img.devices[deviceID-1].device, pa, nil
+	}
+
+	if len(img.devices) > 0 {
+		for _, dev := range img.devices {
+			if dev.mappedBlkAddr == 0 {
+				continue
+			}
+
+			startOff := int64(dev.mappedBlkAddr) << img.sb.BlkSizeBits
+			length := int64(dev.blocks) << img.sb.BlkSizeBits
+
+			if pa >= startOff && pa < startOff+length {
+				return dev.device, pa - startOff, nil
+			}
+		}
+	}
+
+	return img.meta, pa, nil
 }
 
 func (img *image) readMetadata(r io.Reader) ([]byte, error) {
@@ -408,13 +469,11 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 			addr += (blockPos - int64(cn<<chunkbits))
 		}
 
-		reader := img.meta
-		if deviceID > 0 {
-			if int(deviceID) > len(img.extraDevices) {
-				return nil, fmt.Errorf("invalid device id %d", deviceID)
-			}
-			reader = img.extraDevices[deviceID-1]
+		reader, mappedAddr, err := img.mapDev(deviceID, addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to map device for nid %d: %w", fi.nid, err)
 		}
+		addr = mappedAddr
 
 		b := img.getBlock()
 		if n, err := reader.ReadAt(b.buf[blockOffset:blockEnd], addr+int64(blockOffset)); err != nil {

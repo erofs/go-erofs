@@ -19,6 +19,7 @@ const (
 	SizeDirent          = 12
 	SizeXattrBodyHeader = 12
 	SizeXattrEntry      = 4
+	SizeDeviceSlot      = 128
 
 	LayoutFlatPlain         = 0
 	LayoutCompressedFull    = 1
@@ -141,4 +142,13 @@ type InodeChunkIndex struct {
 	StartBlkHi uint16 // part of 48-bit support (not yet implemented)
 	DeviceID   uint16
 	StartBlkLo uint32
+}
+
+// DeviceSlot represents the on-disk device table entry (erofs_deviceslot).
+// See: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/erofs/erofs_fs.h
+type DeviceSlot struct {
+	Tag           [64]uint8 // digest(sha256), etc.
+	Blocks        uint32    // total fs blocks of this device
+	MappedBlkAddr uint32    // map starting at mapped_blkaddr
+	Reserved      [56]uint8
 }
