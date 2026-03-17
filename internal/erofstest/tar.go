@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package tartest
+package erofstest
 
 import (
 	"archive/tar"
