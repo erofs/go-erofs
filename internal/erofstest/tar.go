@@ -185,6 +185,40 @@ func (tc TarContext) File(name string, content []byte, perm os.FileMode) WriterT
 	})
 }
 
+// SparseFile returns a tar entry for a file of the given size filled with
+// zeros, with optional data written at dataOffset. The content is streamed
+// to avoid allocating the full size in memory.
+func (tc TarContext) SparseFile(name string, size int64, data []byte, dataOffset int64, perm os.FileMode) WriterToTar {
+	return writerToFn(func(tw *tar.Writer) error {
+		hdr := tc.newHeader(perm, name, "", size)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		zeros := make([]byte, 64*1024)
+		written := int64(0)
+		for written < size {
+			chunk := size - written
+			if chunk > int64(len(zeros)) {
+				chunk = int64(len(zeros))
+			}
+			buf := zeros[:chunk]
+			// Overlay data at the correct offset.
+			if data != nil && written+chunk > dataOffset && written < dataOffset+int64(len(data)) {
+				buf = make([]byte, chunk)
+				dStart := max(dataOffset-written, 0)
+				sStart := max(written-dataOffset, 0)
+				copy(buf[dStart:], data[sStart:])
+			}
+			n, err := tw.Write(buf)
+			written += int64(n)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // Dir returns a directory tar entry
 func (tc TarContext) Dir(name string, perm os.FileMode) WriterToTar {
 	return writerToFn(func(tw *tar.Writer) error {
