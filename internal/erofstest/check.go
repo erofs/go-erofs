@@ -47,7 +47,7 @@ func CheckDevice(t testing.TB, fsys fs.FS, name string, ftype fs.FileMode, rdev 
 		t.Errorf("open %s: %v", name, err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {

@@ -3,6 +3,7 @@ package erofstest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -38,7 +39,7 @@ func MkfsErofs(opts ...string) Converter {
 	return func(t testing.TB, wt WriterToTar) fs.FS {
 		t.Helper()
 		tarStream := TarFromWriterTo(wt)
-		defer tarStream.Close()
+		defer func() { _ = tarStream.Close() }()
 
 		path := filepath.Join(t.TempDir(), "test.erofs")
 		if err := ConvertTarErofs(context.Background(), tarStream, path, "", opts); err != nil {
@@ -55,7 +56,7 @@ func MkfsErofsBlobDev(chunkSize int, extraOpts ...string) Converter {
 	return func(t testing.TB, wt WriterToTar) fs.FS {
 		t.Helper()
 		tarStream := TarFromWriterTo(wt)
-		defer tarStream.Close()
+		defer func() { _ = tarStream.Close() }()
 
 		path := filepath.Join(t.TempDir(), "test.erofs")
 		blobPath := path + ".blob"
@@ -70,8 +71,31 @@ func MkfsErofsBlobDev(chunkSize int, extraOpts ...string) Converter {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { bf.Close() })
+		t.Cleanup(func() { _ = bf.Close() })
 		return openEroFS(t, path, erofs.WithExtraDevices(bf))
+	}
+}
+
+// MkfsErofsMaxSize is like MkfsErofs but also asserts the image is at
+// most maxBytes. Useful for verifying sparse/dedup optimizations.
+func MkfsErofsMaxSize(maxBytes int64, opts ...string) Converter {
+	return func(t testing.TB, wt WriterToTar) fs.FS {
+		t.Helper()
+		tarStream := TarFromWriterTo(wt)
+		defer func() { _ = tarStream.Close() }()
+
+		path := filepath.Join(t.TempDir(), "test.erofs")
+		if err := ConvertTarErofs(context.Background(), tarStream, path, "", opts); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() > maxBytes {
+			t.Errorf("image size %d exceeds limit %d", fi.Size(), maxBytes)
+		}
+		return openEroFS(t, path)
 	}
 }
 
@@ -82,7 +106,7 @@ func openEroFS(t testing.TB, path string, opts ...erofs.Opt) fs.FS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { f.Close() })
+	t.Cleanup(func() { _ = f.Close() })
 	efs, err := erofs.EroFS(f, opts...)
 	if err != nil {
 		t.Fatal(err)
@@ -283,29 +307,45 @@ var LongXattrs TestCase = &testCase{
 	},
 }
 
-// LargeFiles tests files at 10MB, 50MB, and 150MB. Content is deterministic
-// (seeded by file size) so verification can regenerate expected data.
-var LargeFiles TestCase = &testCase{
+// FileSizes tests files at layout-significant size boundaries:
+//   - 4096 bytes: exactly one block
+//   - 4097 bytes: just over one block (exercises partial second block)
+//   - 8000 bytes: spans 2 blocks with a partial last block
+//   - 1MB: many blocks, exercises sustained sequential reads
+var FileSizes TestCase = &testCase{
 	tar: func() WriterToTar {
 		tc := TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
 		return TarAll(
-			tc.File("/10m.bin", generateContent(10*1024*1024), 0644),
-			tc.File("/50m.bin", generateContent(50*1024*1024), 0644),
-			tc.File("/150m.bin", generateContent(150*1024*1024), 0644),
+			tc.File("/exact-block.bin", generateContent(4096), 0644),
+			tc.File("/block-plus-one.bin", generateContent(4097), 0644),
+			tc.File("/partial-block.bin", generateContent(8000), 0644),
+			tc.File("/multi-block.bin", generateContent(1024*1024), 0644),
 		)
 	},
 	verify: func(t testing.TB, fsys fs.FS) {
 		t.Helper()
-		for _, tc := range []struct {
-			name string
-			size int
-		}{
-			{"10m.bin", 10 * 1024 * 1024},
-			{"50m.bin", 50 * 1024 * 1024},
-			{"150m.bin", 150 * 1024 * 1024},
-		} {
-			verifyContent(t, fsys, tc.name, tc.size)
-		}
+		verifyContent(t, fsys, "exact-block.bin", 4096)
+		verifyContent(t, fsys, "block-plus-one.bin", 4097)
+		verifyContent(t, fsys, "partial-block.bin", 8000)
+		verifyContent(t, fsys, "multi-block.bin", 1024*1024)
+	},
+}
+
+// LargeFile tests a file exceeding 65535 blocks (256MB at 4KB blocks),
+// exercising chunk index overflow where multiple chunk entries are needed.
+// This test case should be run with a single 4KB-chunk converter to avoid
+// redundant work.
+var LargeFile TestCase = &testCase{
+	tar: func() WriterToTar {
+		tc := TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		// 256MB + 4KB to push past the 65535-block boundary.
+		return TarAll(
+			tc.File("/large.bin", generateContent(256*1024*1024+4096), 0644),
+		)
+	},
+	verify: func(t testing.TB, fsys fs.FS) {
+		t.Helper()
+		verifyContent(t, fsys, "large.bin", 256*1024*1024+4096)
 	},
 }
 
@@ -326,7 +366,7 @@ func verifyContent(t testing.TB, fsys fs.FS, name string, size int) {
 		t.Errorf("open %s: %v", name, err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -359,6 +399,114 @@ func verifyContent(t testing.TB, fsys fs.FS, name string, size int) {
 	}
 }
 
+// SparseFiles tests erofs sparse/hole chunk handling. Files contain large
+// zero regions that mkfs.erofs --chunksize optimizes into null chunk entries.
+// The reader must return zeros for these holes. The tar content uses regular
+// (non-sparse) entries with zero-filled data — mkfs.erofs detects the zeros
+// and creates sparse chunks automatically.
+//
+// Note: This test case requires mkfs.erofs with --chunksize to trigger
+// sparse chunk creation. The Go-native builder does not yet produce sparse
+// chunks, so only the mkfs.erofs converter produces correct results.
+var SparseFiles TestCase = &testCase{
+	tar: func() WriterToTar {
+		tc := TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		marker := []byte("hello sparse world!\n")
+		return TarAll(
+			// 10MB file with a marker at offset 5MB.
+			tc.SparseFile("/sparse-10m.bin", 10*1024*1024, marker, 5*1024*1024, 0644),
+			// 20MB file, entirely zeros.
+			tc.SparseFile("/sparse-20m.bin", 20*1024*1024, nil, 0, 0644),
+		)
+	},
+	verify: func(t testing.TB, fsys fs.FS) {
+		t.Helper()
+		marker := "hello sparse world!\n"
+
+		verifySparse(t, fsys, "sparse-10m.bin", 10*1024*1024, 5*1024*1024, marker)
+		verifySparse(t, fsys, "sparse-20m.bin", 20*1024*1024, -1, "")
+	},
+}
+
+// verifySparse checks a sparse file's size, verifies zeros by sampling a
+// 4KB block every 1MB, and optionally checks for a data marker at markerOff.
+// Set markerOff to -1 to skip the marker check.
+func verifySparse(t testing.TB, fsys fs.FS, name string, size int64, markerOff int64, marker string) {
+	t.Helper()
+	f, err := fsys.Open(name)
+	if err != nil {
+		t.Errorf("open %s: %v", name, err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Errorf("stat %s: %v", name, err)
+		return
+	}
+	if fi.Size() != size {
+		t.Errorf("%s: size %d, want %d", name, fi.Size(), size)
+		return
+	}
+
+	// Sample a 4KB block every 1MB to verify zeros.
+	const step = 1024 * 1024
+	buf := make([]byte, 4096)
+	offset := int64(0)
+	for sampleOff := int64(0); sampleOff < size; sampleOff += step {
+		// Skip to the sample offset.
+		if sampleOff > offset {
+			skipped, err := io.CopyN(io.Discard, f, sampleOff-offset)
+			if err != nil {
+				t.Errorf("%s: skip to offset %d: %v", name, sampleOff, err)
+				return
+			}
+			offset += skipped
+		}
+		toRead := min(int64(len(buf)), size-offset)
+		n, err := io.ReadFull(f, buf[:toRead])
+		if err != nil && int64(n) != toRead {
+			t.Errorf("%s: read at offset %d: got %d bytes, want %d: %v", name, offset, n, toRead, err)
+			return
+		}
+		// If this overlaps with the marker, skip the zero check.
+		if markerOff >= 0 && offset <= markerOff+int64(len(marker)) && offset+int64(n) > markerOff {
+			offset += int64(n)
+			continue
+		}
+		for i := range n {
+			if buf[i] != 0 {
+				t.Errorf("%s: non-zero byte at offset %d", name, offset+int64(i))
+				return
+			}
+		}
+		offset += int64(n)
+	}
+
+	// Check marker if specified.
+	if markerOff >= 0 {
+		f2, err := fsys.Open(name)
+		if err != nil {
+			t.Errorf("open %s for marker check: %v", name, err)
+			return
+		}
+		defer func() { _ = f2.Close() }()
+		if _, err := io.CopyN(io.Discard, f2, markerOff); err != nil {
+			t.Errorf("%s: skip to marker at %d: %v", name, markerOff, err)
+			return
+		}
+		mbuf := make([]byte, len(marker))
+		if _, err := io.ReadFull(f2, mbuf); err != nil {
+			t.Errorf("%s: read marker at %d: %v", name, markerOff, err)
+			return
+		}
+		if string(mbuf) != marker {
+			t.Errorf("%s at offset %d: got %q, want %q", name, markerOff, mbuf, marker)
+		}
+	}
+}
+
 // XattrPrefixFlags returns mkfs.erofs flags to enable long xattr prefix
 // compression for the prefixes used in LongXattrs. Returns nil if the
 // installed mkfs.erofs doesn't support --xattr-prefix (< 1.9).
@@ -381,7 +529,7 @@ func CheckFile(t testing.TB, fsys fs.FS, name, expected string) {
 		t.Errorf("open %s: %v", name, err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	data, err := io.ReadAll(f)
 	if err != nil {
@@ -406,7 +554,7 @@ func CheckFileBytes(t testing.TB, fsys fs.FS, name string, expected []byte) {
 		t.Errorf("open %s: %v", name, err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	data, err := io.ReadAll(f)
 	if err != nil {
@@ -468,9 +616,14 @@ func CheckSymlink(t testing.TB, fsys fs.FS, name, expectedTarget string) {
 // CheckNotExists verifies that the named path does not exist.
 func CheckNotExists(t testing.TB, fsys fs.FS, name string) {
 	t.Helper()
-	_, err := fsys.Open(name)
+	f, err := fsys.Open(name)
 	if err == nil {
-		t.Errorf("expected error opening %s", name)
+		if err = f.Close(); err != nil {
+			t.Errorf("close %s: %v", name, err)
+		}
+		t.Errorf("expected error opening %s, but succeeded", name)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("open %s: got %v, want fs.ErrNotExist", name, err)
 	}
 }
 

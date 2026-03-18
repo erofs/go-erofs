@@ -26,7 +26,7 @@ func TestErofs(t *testing.T) {
 		flags []string // extra mkfs.erofs flags
 	}{
 		{"Basic", erofstest.Basic, nil},
-		{"LargeFiles", erofstest.LargeFiles, nil},
+		{"FileSizes", erofstest.FileSizes, nil},
 		{"LongXattrs", erofstest.LongXattrs, erofstest.XattrPrefixFlags()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,18 +46,33 @@ func TestErofs(t *testing.T) {
 		})
 	}
 
+	// Large file: 256MB+ to exercise chunk index overflow (run once with 4K chunks).
+	t.Run("LargeFile", func(t *testing.T) {
+		erofstest.LargeFile.Run(t, erofstest.MkfsErofs(fmt.Sprintf("--chunksize=%d", minChunk)))
+	})
+
+	// Sparse files require --chunksize and produce images under 1MB
+	// despite 30MB of logical content.
+	t.Run("SparseFiles", func(t *testing.T) {
+		chunkFlag := fmt.Sprintf("--chunksize=%d", minChunk)
+		erofstest.SparseFiles.Run(t, erofstest.MkfsErofsMaxSize(1024*1024, chunkFlag))
+	})
+
 	// Compression format is unimplemented — verify EroFS returns ErrNotImplemented.
 	t.Run("lz4-unimplemented", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("mkfs.erofs compression is not included on Windows")
 		}
-		// Create a compressed erofs image using mkfs.erofs -zlz4.
 		tc := erofstest.TarContext{}
 		wt := erofstest.TarAll(
 			tc.File("/file.txt", []byte("content\n"), 0644),
 		)
 		tarStream := erofstest.TarFromWriterTo(wt)
-		defer tarStream.Close()
+		defer func() {
+			if err := tarStream.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 
 		path := filepath.Join(t.TempDir(), "compressed.erofs")
 		if err := erofstest.ConvertTarErofs(context.Background(), tarStream, path, "", []string{"-zlz4"}); err != nil {
@@ -68,7 +83,11 @@ func TestErofs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 
 		_, err = erofs.EroFS(f)
 		if !errors.Is(err, erofs.ErrNotImplemented) {
