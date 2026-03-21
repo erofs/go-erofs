@@ -30,7 +30,7 @@ func run(path string) error {
 	}
 	defer func() { _ = f.Close() }()
 
-	img, err := erofs.EroFS(f)
+	img, err := erofs.Open(f)
 	if err != nil {
 		return err
 	}

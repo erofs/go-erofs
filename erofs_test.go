@@ -89,7 +89,7 @@ func TestErofs(t *testing.T) {
 			}
 		}()
 
-		_, err = erofs.EroFS(f)
+		_, err = erofs.Open(f)
 		if !errors.Is(err, erofs.ErrNotImplemented) {
 			t.Fatalf("expected ErrNotImplemented, got %v", err)
 		}
