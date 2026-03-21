@@ -100,14 +100,14 @@ func MkfsErofsMaxSize(maxBytes int64, opts ...string) Converter {
 }
 
 // openEroFS opens an EROFS image file and returns an fs.FS.
-func openEroFS(t testing.TB, path string, opts ...erofs.Opt) fs.FS {
+func openEroFS(t testing.TB, path string, opts ...erofs.OpenOpt) fs.FS {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = f.Close() })
-	efs, err := erofs.EroFS(f, opts...)
+	efs, err := erofs.Open(f, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -53,22 +53,25 @@ type options struct {
 	extraDevices []io.ReaderAt
 }
 
-// Opt is an option for configuring the EroFS reader
-type Opt func(*options)
+// OpenOpt is an option for configuring the EROFS reader
+type OpenOpt func(*options)
+
+// Deprecated: Use [OpenOpt] instead, will be removed in 0.3
+type Opt = OpenOpt
 
 // WithExtraDevices specifies additional devices to read
 // chunk data from
-func WithExtraDevices(devices ...io.ReaderAt) Opt {
+func WithExtraDevices(devices ...io.ReaderAt) OpenOpt {
 	return func(o *options) {
 		o.extraDevices = append(o.extraDevices, devices...)
 	}
 }
 
-// EroFS returns a FileSystem reading from the given readerat.
-// The readerat must be a valid erofs block file.
+// Open returns a FileSystem reading from the given ReaderAt.
+// The ReaderAt must be a valid EROFS block file.
 // No additional memory mapping is done and must be handled by
 // the caller.
-func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
+func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 	o := options{}
 	for _, opt := range opts {
 		opt(&o)
@@ -147,6 +150,11 @@ func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
 	}
 
 	return &i, nil
+}
+
+// Deprecated: Use [Open] instead, will be removed in 0.3
+func EroFS(r io.ReaderAt, opts ...Opt) (fs.FS, error) {
+	return Open(r, opts...)
 }
 
 // roundupPowerOfTwo rounds v up to the next power of two.
