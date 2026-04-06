@@ -215,6 +215,10 @@ var Basic TestCase = &testCase{
 		CheckNotExists(t, fsys, "not-exists/somefile")
 		CheckNotExists(t, fsys, "usr/lib/testdir/emptydir/somefile")
 
+		// Opening a path through a non-directory component returns ErrNotDirectory.
+		CheckOpenError(t, fsys, "in-root.txt/child", erofs.ErrNotDirectory)
+		CheckOpenError(t, fsys, "usr/lib/testdir/emptyfile/child", erofs.ErrNotDirectory)
+
 		CheckXattrs(t, fsys, "usr/lib/withxattr", map[string]string{
 			"user.custom":      "value1",
 			"user.xdg.comment": "some random comment",
@@ -263,6 +267,12 @@ var Basic TestCase = &testCase{
 		CheckReadFile(t, fsys, "in-root.txt", "root file content\n")
 		CheckReadFileDir(t, fsys, "usr/lib/testdir")
 		CheckReadDirSorted(t, fsys, "dev")
+
+		// ReadDir on a file should return ErrNotDirectory.
+		CheckReadDirFile(t, fsys, "in-root.txt")
+
+		// ReadLink on a regular file should return ErrInvalid.
+		CheckReadLinkFile(t, fsys, "in-root.txt")
 	},
 }
 
@@ -689,6 +699,8 @@ func CheckReadFileDir(t testing.TB, fsys fs.FS, name string) {
 	_, err := fs.ReadFile(fsys, name)
 	if err == nil {
 		t.Errorf("ReadFile(%s) should fail on directory", name)
+	} else if !errors.Is(err, erofs.ErrIsDirectory) {
+		t.Errorf("ReadFile(%s): got %v, want erofs.ErrIsDirectory", name, err)
 	}
 }
 
@@ -705,5 +717,52 @@ func CheckReadDirSorted(t testing.TB, fsys fs.FS, name string) {
 			t.Errorf("ReadDir(%s) not sorted: %q >= %q at index %d", name, entries[i-1].Name(), entries[i].Name(), i)
 			return
 		}
+	}
+}
+
+// CheckOpenError verifies that Open returns an error matching target.
+func CheckOpenError(t testing.TB, fsys fs.FS, name string, target error) {
+	t.Helper()
+	f, err := fsys.Open(name)
+	if err == nil {
+		_ = f.Close()
+		t.Errorf("Open(%s): expected error %v, got nil", name, target)
+	} else if !errors.Is(err, target) {
+		t.Errorf("Open(%s): got %v, want %v", name, err, target)
+	}
+}
+
+// CheckReadDirFile verifies that ReadDir on a non-directory returns ErrNotDirectory.
+func CheckReadDirFile(t testing.TB, fsys fs.FS, name string) {
+	t.Helper()
+	type readDirFS interface {
+		ReadDir(name string) ([]fs.DirEntry, error)
+	}
+	rdfs, ok := fsys.(readDirFS)
+	if !ok {
+		t.Errorf("FS does not implement ReadDir")
+		return
+	}
+	_, err := rdfs.ReadDir(name)
+	if err == nil {
+		t.Errorf("ReadDir(%s) should fail on non-directory", name)
+	} else if !errors.Is(err, erofs.ErrNotDirectory) {
+		t.Errorf("ReadDir(%s): got %v, want erofs.ErrNotDirectory", name, err)
+	}
+}
+
+// CheckReadLinkFile verifies that ReadLink on a non-symlink returns fs.ErrInvalid.
+func CheckReadLinkFile(t testing.TB, fsys fs.FS, name string) {
+	t.Helper()
+	rlfs, ok := fsys.(readLinkFS)
+	if !ok {
+		t.Errorf("FS does not implement ReadLink")
+		return
+	}
+	_, err := rlfs.ReadLink(name)
+	if err == nil {
+		t.Errorf("ReadLink(%s) should fail on non-symlink", name)
+	} else if !errors.Is(err, fs.ErrInvalid) {
+		t.Errorf("ReadLink(%s): got %v, want fs.ErrInvalid", name, err)
 	}
 }

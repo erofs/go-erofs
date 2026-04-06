@@ -32,6 +32,17 @@ var (
 	// ErrNotImplemented is returned when a feature is known but not implemented
 	// yet by this library
 	ErrNotImplemented = errors.New("not implemented")
+
+	// ErrNotDirectory is returned when a path component is not a directory.
+	ErrNotDirectory = errors.New("not a directory")
+
+	// ErrIsDirectory is returned when an operation expected a file but found
+	// a directory.
+	ErrIsDirectory = errors.New("is a directory")
+
+	// ErrLoop is returned when too many symlinks are encountered during
+	// path resolution.
+	ErrLoop = fmt.Errorf("too many symlinks: %w", ErrInvalid)
 )
 
 // Stat is the erofs specific stat data returned by Stat and FileInfo requests
@@ -581,7 +592,7 @@ func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.File
 		}
 
 		if ftype != fs.ModeDir {
-			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: errors.New("not a directory")}
+			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: ErrNotDirectory}
 		}
 		d := &dir{
 			file: file{
@@ -594,7 +605,7 @@ func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.File
 		// TODO: Lookup in directory instead of reading all
 		entries, err := d.ReadDir(-1)
 		if err != nil {
-			return 0, 0, "", fmt.Errorf("failed to read dir: %w", err)
+			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: err}
 		}
 		var found bool
 		for _, e := range entries {
@@ -614,7 +625,7 @@ func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.File
 		if ftype&fs.ModeSymlink != 0 && (follow || !isFinal) {
 			linksFollowed++
 			if linksFollowed > maxSymlinks {
-				return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: errors.New("too many symlinks")}
+				return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: ErrLoop}
 			}
 			target, err := i.readLink(nid, basename)
 			if err != nil {
@@ -685,7 +696,7 @@ func (i *image) ReadFile(name string) ([]byte, error) {
 		return nil, err
 	}
 	if ftype.IsDir() {
-		return nil, &fs.PathError{Op: "read", Path: name, Err: errors.New("is a directory")}
+		return nil, &fs.PathError{Op: "read", Path: name, Err: ErrIsDirectory}
 	}
 	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
 	fi, err := f.readInfo(false)
@@ -707,7 +718,7 @@ func (i *image) ReadDir(name string) ([]fs.DirEntry, error) {
 		return nil, err
 	}
 	if !ftype.IsDir() {
-		return nil, &fs.PathError{Op: "readdir", Path: name, Err: errors.New("not a directory")}
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: ErrNotDirectory}
 	}
 	d := &dir{file: file{img: i, name: basename, nid: nid, ftype: ftype}}
 	entries, err := d.ReadDir(-1)
@@ -726,7 +737,7 @@ func (i *image) ReadLink(name string) (string, error) {
 		return "", err
 	}
 	if ftype&fs.ModeSymlink == 0 {
-		return "", &fs.PathError{Op: "readlink", Path: name, Err: errors.New("not a symlink")}
+		return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
 	}
 	return i.readLink(nid, basename)
 }
