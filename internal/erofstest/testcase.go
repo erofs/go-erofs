@@ -273,6 +273,10 @@ var Basic TestCase = &testCase{
 
 		// ReadLink on a regular file should return ErrInvalid.
 		CheckReadLinkFile(t, fsys, "in-root.txt")
+
+		// Close without reading should not panic.
+		CheckOpenClose(t, fsys, "in-root.txt")
+		CheckOpenClose(t, fsys, "usr/lib/testdir")
 	},
 }
 
@@ -764,5 +768,19 @@ func CheckReadLinkFile(t testing.TB, fsys fs.FS, name string) {
 		t.Errorf("ReadLink(%s) should fail on non-symlink", name)
 	} else if !errors.Is(err, fs.ErrInvalid) {
 		t.Errorf("ReadLink(%s): got %v, want fs.ErrInvalid", name, err)
+	}
+}
+
+// CheckOpenClose verifies that opening and immediately closing a file
+// without reading does not panic.
+func CheckOpenClose(t testing.TB, fsys fs.FS, name string) {
+	t.Helper()
+	f, err := fsys.Open(name)
+	if err != nil {
+		t.Errorf("Open(%s): %v", name, err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		t.Errorf("Close(%s): %v", name, err)
 	}
 }
