@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/erofs/go-erofs"
 	"github.com/erofs/go-erofs/internal/erofstest"
@@ -94,4 +95,58 @@ func TestErofs(t *testing.T) {
 			t.Fatalf("expected ErrNotImplemented, got %v", err)
 		}
 	})
+}
+
+func BenchmarkLookup(b *testing.B) {
+	if _, err := erofstest.CheckMkfsVersion("1.0"); err != nil {
+		b.Skipf("skipping: %v", err)
+	}
+
+	tc := erofstest.TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	// Build a tar with directories of varying sizes.
+	lotsOfFiles := make(chan erofstest.WriterToTar)
+	go func() {
+		for i := range 5000 {
+			lotsOfFiles <- tc.File(fmt.Sprintf("/bigdir/%d", i), []byte{}, 0600)
+		}
+		close(lotsOfFiles)
+	}()
+
+	wt := erofstest.TarAll(
+		tc.Dir("/a", 0755),
+		tc.Dir("/a/b", 0755),
+		tc.Dir("/a/b/c", 0755),
+		tc.File("/a/b/c/file.txt", []byte("content\n"), 0644),
+		tc.Dir("/smalldir", 0755),
+		tc.File("/smalldir/file.txt", []byte("content\n"), 0644),
+		tc.Dir("/bigdir", 0755),
+		erofstest.TarStream(lotsOfFiles),
+	)
+
+	fsys := erofstest.MkfsErofs()(b, wt)
+
+	for _, bc := range []struct {
+		name string
+		path string
+	}{
+		{"shallow", "smalldir/file.txt"},
+		{"deep", "a/b/c/file.txt"},
+		{"bigdir-first", "bigdir/0"},
+		{"bigdir-last", "bigdir/4999"},
+		{"bigdir-notfound", "bigdir/nonexistent"},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			for range b.N {
+				f, err := fsys.Open(bc.path)
+				if err != nil {
+					if bc.name == "bigdir-notfound" {
+						continue
+					}
+					b.Fatal(err)
+				}
+				_ = f.Close()
+			}
+		})
+	}
 }
