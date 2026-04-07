@@ -2,6 +2,7 @@ package erofs
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"errors"
@@ -602,22 +603,12 @@ func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.File
 				ftype: ftype,
 			},
 		}
-		// TODO: Lookup in directory instead of reading all
-		entries, err := d.ReadDir(-1)
+		entNid, entFtype, err := d.lookup(basename)
 		if err != nil {
 			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: err}
 		}
-		var found bool
-		for _, e := range entries {
-			if e.Name() == basename {
-				nid = e.(*direntry).nid
-				ftype = e.(*direntry).ftype & fs.ModeType
-				found = true
-			}
-		}
-		if !found {
-			return 0, 0, "", &fs.PathError{Op: op, Path: original, Err: fs.ErrNotExist}
-		}
+		nid = entNid
+		ftype = entFtype & fs.ModeType
 
 		// Follow symlinks for intermediate components always,
 		// and for the final component only when follow is true.
@@ -1031,6 +1022,183 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 	}
 
 	return ents, nil
+}
+
+// lookup searches for a directory entry by name using binary search.
+// EROFS directories are sorted by name both within and across blocks.
+// A cross-block binary search locates the correct block, then an
+// intra-block binary search finds the entry.
+// Returns the nid and file type if found, or fs.ErrNotExist if not.
+func (d *dir) lookup(target string) (uint64, fs.FileMode, error) {
+	fi, err := d.readInfo(false)
+	if err != nil {
+		return 0, 0, fmt.Errorf("readInfo failed: %w", err)
+	}
+
+	targetBytes := []byte(target)
+	blkSize := int64(1 << d.img.sb.BlkSizeBits)
+	nblocks := int((fi.size + blkSize - 1) / blkSize)
+
+	// Binary search across blocks: compare target against the first
+	// entry of each block to find which block may contain the target.
+	// The last loaded block is retained to avoid reloading it for the
+	// intra-block search.
+	var lastBlk *block
+	lastIdx := -1
+	lo, hi := 0, nblocks
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		pos := int64(mid) * blkSize
+		b, err := d.img.loadBlock(fi, pos)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				hi = mid
+				continue
+			}
+			if lastBlk != nil {
+				d.img.putBlock(lastBlk)
+			}
+			return 0, 0, err
+		}
+		buf := b.bytes()
+		firstName, err := blockFirstName(buf)
+		if err != nil {
+			d.img.putBlock(b)
+			if lastBlk != nil {
+				d.img.putBlock(lastBlk)
+			}
+			return 0, 0, err
+		}
+
+		if bytes.Compare(firstName, targetBytes) <= 0 {
+			// This block's first entry <= target; keep it as candidate.
+			if lastBlk != nil {
+				d.img.putBlock(lastBlk)
+			}
+			lastBlk = b
+			lastIdx = mid
+			lo = mid + 1
+		} else {
+			d.img.putBlock(b)
+			hi = mid
+		}
+	}
+
+	// lastIdx is the last block whose first entry <= target.
+	// The target must be in that block if it exists.
+	if lastIdx < 0 {
+		return 0, 0, fs.ErrNotExist
+	}
+
+	buf := lastBlk.bytes()
+	nid, ftype, err := lookupBlock(buf, targetBytes)
+	d.img.putBlock(lastBlk)
+	return nid, ftype, err
+}
+
+// blockFirstName returns the name of the first entry in a directory block.
+func blockFirstName(buf []byte) ([]byte, error) {
+	if len(buf) < disk.SizeDirent {
+		return nil, fmt.Errorf("directory block too small: %w", ErrInvalid)
+	}
+	var first disk.Dirent
+	if _, err := binary.Decode(buf[:disk.SizeDirent], binary.LittleEndian, &first); err != nil {
+		return nil, fmt.Errorf("decode failed: %w", err)
+	}
+	entryN := first.NameOff / disk.SizeDirent
+	if entryN == 0 || int(first.NameOff) > len(buf) {
+		return nil, fmt.Errorf("invalid name offset %d: %w", first.NameOff, ErrInvalid)
+	}
+	var nameEnd uint16
+	if entryN > 1 {
+		nextOff := int(disk.SizeDirent) + 8
+		if nextOff+2 > len(buf) {
+			return nil, fmt.Errorf("next dirent name offset out of range: %w", ErrInvalid)
+		}
+		nameEnd = binary.LittleEndian.Uint16(buf[nextOff:])
+	} else {
+		nameEnd = uint16(len(buf))
+	}
+	if first.NameOff > nameEnd || int(nameEnd) > len(buf) {
+		return nil, fmt.Errorf("name range [%d:%d] out of bounds: %w", first.NameOff, nameEnd, ErrInvalid)
+	}
+	name := buf[first.NameOff:nameEnd]
+	// Trim NUL terminator if present
+	if i := bytes.IndexByte(name, 0); i >= 0 {
+		name = name[:i]
+	}
+	return name, nil
+}
+
+// blockDirent decodes the dirent at index i from buf and returns the
+// name bytes for that entry. entryN is the total number of entries.
+func blockDirent(buf []byte, i, entryN uint16) (disk.Dirent, []byte, error) {
+	var de disk.Dirent
+	off := int(disk.SizeDirent * i)
+	if off+disk.SizeDirent > len(buf) {
+		return de, nil, fmt.Errorf("dirent %d offset %d out of range: %w", i, off, ErrInvalid)
+	}
+	if _, err := binary.Decode(buf[off:off+disk.SizeDirent], binary.LittleEndian, &de); err != nil {
+		return de, nil, fmt.Errorf("decode dirent %d failed: %w", i, err)
+	}
+	var nameEnd uint16
+	if i < entryN-1 {
+		nextOff := int(disk.SizeDirent*(i+1)) + 8
+		if nextOff+2 > len(buf) {
+			return de, nil, fmt.Errorf("dirent %d next name offset out of range: %w", i, ErrInvalid)
+		}
+		nameEnd = binary.LittleEndian.Uint16(buf[nextOff:])
+	} else {
+		nameEnd = uint16(len(buf))
+	}
+	if de.NameOff > nameEnd || int(nameEnd) > len(buf) {
+		return de, nil, fmt.Errorf("dirent %d name range [%d:%d] out of bounds: %w", i, de.NameOff, nameEnd, ErrInvalid)
+	}
+	name := buf[de.NameOff:nameEnd]
+	// The last entry name may be NUL-terminated before the end of the block.
+	if i == entryN-1 {
+		if j := bytes.IndexByte(name, 0); j >= 0 {
+			name = name[:j]
+		}
+	}
+	return de, name, nil
+}
+
+// lookupBlock searches a single directory block for the target name
+// using binary search.
+func lookupBlock(buf, target []byte) (uint64, fs.FileMode, error) {
+	if len(buf) < disk.SizeDirent {
+		return 0, 0, fmt.Errorf("directory block too small: %w", ErrInvalid)
+	}
+	var first disk.Dirent
+	if _, err := binary.Decode(buf[:disk.SizeDirent], binary.LittleEndian, &first); err != nil {
+		return 0, 0, fmt.Errorf("decode failed: %w", err)
+	}
+	if first.NameOff%disk.SizeDirent != 0 {
+		return 0, 0, fmt.Errorf("invalid name offset %d not aligned to dirent size: %w", first.NameOff, ErrInvalid)
+	}
+	entryN := first.NameOff / disk.SizeDirent
+	if int(first.NameOff) > len(buf) {
+		return 0, 0, fmt.Errorf("name offset %d exceeds block size %d: %w", first.NameOff, len(buf), ErrInvalid)
+	}
+
+	lo, hi := uint16(0), entryN
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		de, name, err := blockDirent(buf, mid, entryN)
+		if err != nil {
+			return 0, 0, err
+		}
+		switch bytes.Compare(name, target) {
+		case 0:
+			return de.Nid, disk.EroFSFtypeToFileMode(de.FileType), nil
+		case -1:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return 0, 0, fs.ErrNotExist
 }
 
 type fileInfo struct {
