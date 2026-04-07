@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -140,10 +141,10 @@ func BenchmarkLookup(b *testing.B) {
 			for range b.N {
 				f, err := fsys.Open(bc.path)
 				if err != nil {
-					if bc.name == "bigdir-notfound" {
-						continue
+					if !errors.Is(err, fs.ErrNotExist) {
+						b.Fatal(err)
 					}
-					b.Fatal(err)
+					continue
 				}
 				_ = f.Close()
 			}

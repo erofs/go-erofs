@@ -910,7 +910,10 @@ func (b *file) Read(p []byte) (int, error) {
 }
 
 func (b *file) Close() error {
-	b.info.cached = nil
+	if b.info != nil && b.info.cached != nil {
+		b.img.putBlock(b.info.cached)
+		b.info.cached = nil
+	}
 	return nil
 }
 
