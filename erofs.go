@@ -205,6 +205,13 @@ func (img *image) metaStartPos() int64 {
 	return int64(img.sb.MetaBlkAddr) << int64(img.sb.BlkSizeBits)
 }
 
+// maxReadFileSize is the maximum file size that ReadFile will allocate.
+// ReadFile is intended for small files; for larger files, callers should
+// use Open and io.Copy. 128 MiB is generous for typical use (configs,
+// manifests, symlink targets, etc.) while guarding against
+// unexpectedly large files.
+const maxReadFileSize = 128 << 20 // 128 MiB
+
 // mapDev resolves map->m_bdev and map->m_pa mapping for go-erofs.
 // It works similarly to erofs_map_dev in the linux kernel.
 func (img *image) mapDev(deviceID uint16, pa int64) (io.ReaderAt, int64, error) {
@@ -540,12 +547,19 @@ func (img *image) putBlock(b *block) {
 
 const maxSymlinks = 255
 
+// maxSymlinkSize is the maximum size of a symlink target.
+// Linux PATH_MAX is 4096; we use the same limit.
+const maxSymlinkSize = 4096
+
 // readLink reads the symlink target for the given nid.
 func (i *image) readLink(nid uint64, name string) (string, error) {
 	f := &file{img: i, name: name, nid: nid, ftype: fs.ModeSymlink}
 	fi, err := f.readInfo(false)
 	if err != nil {
 		return "", err
+	}
+	if fi.size < 0 || fi.size > maxSymlinkSize {
+		return "", fmt.Errorf("symlink target size %d out of range: %w", fi.size, ErrInvalid)
 	}
 	buf := make([]byte, fi.size)
 	if fi.size > 0 {
@@ -681,6 +695,9 @@ func (i *image) Stat(name string) (fs.FileInfo, error) {
 	return f.readInfo(true)
 }
 
+// ReadFile reads the named file and returns its contents.
+// Files larger than maxReadFileSize (128 MiB) are rejected;
+// use Open and io.Copy for larger files.
 func (i *image) ReadFile(name string) ([]byte, error) {
 	nid, ftype, basename, err := i.resolve("readfile", name, true)
 	if err != nil {
@@ -693,6 +710,9 @@ func (i *image) ReadFile(name string) ([]byte, error) {
 	fi, err := f.readInfo(false)
 	if err != nil {
 		return nil, err
+	}
+	if fi.size < 0 || fi.size > maxReadFileSize {
+		return nil, fmt.Errorf("file size %d exceeds ReadFile limit %d; use Open and io.Copy for large files: %w", fi.size, int64(maxReadFileSize), ErrInvalid)
 	}
 	buf := make([]byte, fi.size)
 	if fi.size > 0 {
@@ -959,51 +979,76 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 		b, err := d.img.loadBlock(fi, pos)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return ents, nil
+				break
 			}
 			return nil, err
 		}
 		buf := b.bytes()
 		if len(buf) < 12 {
-			return ents, nil
+			d.img.putBlock(b)
+			break
 		}
 
 		var dirents [2]disk.Dirent
 
 		readN, err := binary.Decode(buf[:12], binary.LittleEndian, &dirents[0])
 		if err != nil {
+			d.img.putBlock(b)
 			return nil, fmt.Errorf("decode failed: %w", err)
 		}
 		if readN != 12 {
+			d.img.putBlock(b)
 			return nil, errors.New("invalid dirent: not fully decoded")
 		}
 
 		entryN := dirents[0].NameOff / disk.SizeDirent
+		bufLen := len(buf)
+
+		// Validate that NameOff is within bounds and dirent entries fit.
+		if int(dirents[0].NameOff) > bufLen || entryN == 0 {
+			d.img.putBlock(b)
+			return ents, fmt.Errorf("invalid dirent name offset %d (buf size %d): %w", dirents[0].NameOff, bufLen, ErrInvalid)
+		}
 
 		for i := uint16(0); i < entryN; i++ {
 			var name string
 			if i < entryN-1 {
-				start := 12 * (i + 1)
-				readN, err := binary.Decode(buf[start:start+12], binary.LittleEndian, &dirents[1])
+				start := int(disk.SizeDirent) * (int(i) + 1)
+				if start+int(disk.SizeDirent) > bufLen {
+					d.img.putBlock(b)
+					return ents, fmt.Errorf("dirent entry %d exceeds block: %w", i+1, ErrInvalid)
+				}
+				readN, err := binary.Decode(buf[start:start+int(disk.SizeDirent)], binary.LittleEndian, &dirents[1])
 				if err != nil {
+					d.img.putBlock(b)
 					return nil, fmt.Errorf("decode failed: %w", err)
 				}
 				if readN != 12 {
+					d.img.putBlock(b)
 					return nil, errors.New("invalid dirent: not fully decoded")
+				}
+				if int(dirents[0].NameOff) > bufLen || int(dirents[1].NameOff) > bufLen || dirents[1].NameOff < dirents[0].NameOff {
+					d.img.putBlock(b)
+					return ents, fmt.Errorf("invalid dirent name offset range [%d:%d] (buf size %d): %w",
+						dirents[0].NameOff, dirents[1].NameOff, bufLen, ErrInvalid)
 				}
 				name = string(buf[dirents[0].NameOff:dirents[1].NameOff])
 			} else {
+				if int(dirents[0].NameOff) > bufLen {
+					d.img.putBlock(b)
+					return ents, fmt.Errorf("invalid dirent name offset %d (buf size %d): %w", dirents[0].NameOff, bufLen, ErrInvalid)
+				}
 				name = string(buf[dirents[0].NameOff:])
 			}
 
 			if i >= d.consumed && name != "." && name != ".." {
-				b := file{
+				f := file{
 					img:   d.img,
 					name:  name,
 					nid:   dirents[0].Nid,
 					ftype: disk.EroFSFtypeToFileMode(dirents[0].FileType),
 				}
-				ents = append(ents, &direntry{b})
+				ents = append(ents, &direntry{f})
 				d.consumed = i + 1
 
 				if n > 0 && len(ents) == n {
@@ -1011,6 +1056,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 						d.consumed = 0
 						d.bn++
 					}
+					d.img.putBlock(b)
 					return ents, nil
 				}
 			}
@@ -1019,11 +1065,18 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 			dirents[0] = dirents[1]
 		}
 
+		d.img.putBlock(b)
 		d.consumed = 0
 		d.bn++
 		pos = int64(d.bn << d.img.sb.BlkSizeBits)
 	}
 
+	// Per fs.ReadDirFile contract: when n > 0 and we've reached the end
+	// of the directory, return io.EOF. When n <= 0, return all entries
+	// without io.EOF.
+	if n > 0 {
+		return ents, io.EOF
+	}
 	return ents, nil
 }
 
