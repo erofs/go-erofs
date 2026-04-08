@@ -70,6 +70,43 @@ jobs:
       - name: Test
         run: go test -v ./...
 
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install erofs-utils build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config libz-dev liblz4-dev uuid-dev
+
+      - name: Build and install erofs-utils
+        run: |
+          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz | tar -xzf -
+          cd erofs-utils-${EROFS_UTILS_VERSION#v}
+          for p in "${GITHUB_WORKSPACE}"/.github/workflows/patches/erofs-utils/*.patch; do
+            patch -p1 < "$p"
+          done
+          ./autogen.sh
+          ./configure --enable-lz4
+          make -j"$(nproc)"
+          sudo make install
+          mkfs.erofs -V
+
+      - name: Fuzz
+        run: |
+          fuzz_time=10s
+          for target in $(go test -list 'Fuzz.*' . 2>/dev/null | grep '^Fuzz'); do
+            echo "::group::$target"
+            go test -fuzz="^${target}\$" -fuzztime=$fuzz_time -timeout=120s . && echo "PASS: $target" || exit 1
+            echo "::endgroup::"
+          done
+
   cross-compile-mkfs-windows:
     name: Cross-compile mkfs.erofs for Windows
     runs-on: ubuntu-latest
