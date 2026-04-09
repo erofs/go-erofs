@@ -1,3 +1,32 @@
+// Package erofs reads and creates EROFS filesystem images.
+//
+// # Reading
+//
+// Use [Open] to read an existing EROFS image through Go's standard [fs.FS]
+// interface:
+//
+//	img, err := erofs.Open(f)
+//	data, err := fs.ReadFile(img, "etc/hostname")
+//
+// # Writing
+//
+// Use [Create] to build a new EROFS image. Entries can be added one at a
+// time, or bulk-copied from any [fs.FS] via [Writer.CopyFrom]:
+//
+//	w := erofs.Create(outFile)
+//	w.CopyFrom(srcFS)
+//	w.Close()
+//
+// A tar archive adapter is provided by the [tar] sub-package.
+//
+// For metadata-only images that reference data in an external source
+// (e.g. for container layer indexing), pass [MetadataOnly] to CopyFrom:
+//
+//	w := erofs.Create(outFile)
+//	w.CopyFrom(tarFS, erofs.MetadataOnly())
+//	w.Close()
+//
+// [tar]: https://pkg.go.dev/github.com/erofs/go-erofs/tar
 package erofs
 
 import (
@@ -238,6 +267,111 @@ func (img *image) mapDev(deviceID uint16, pa int64) (io.ReaderAt, int64, error) 
 	}
 
 	return img.meta, pa, nil
+}
+
+// blockSize returns the filesystem block size.
+func (img *image) blockSize() uint32 { return 1 << img.sb.BlkSizeBits }
+
+// buildTime returns the build timestamp from the superblock.
+func (img *image) buildTime() uint64 { return img.sb.BuildTime }
+
+// deviceBlocks returns the total block count across all extra devices.
+// Each device's block count is reported at the device's native block size
+// (matching the superblock block size).
+func (img *image) deviceBlocks() []uint64 {
+	if len(img.devices) == 0 {
+		return nil
+	}
+	blocks := make([]uint64, len(img.devices))
+	for i, d := range img.devices {
+		blocks[i] = uint64(d.blocks)
+	}
+	return blocks
+}
+
+// openDirect returns an io.Reader for a file's data that reads directly
+// from the underlying metadata reader, bypassing the block-at-a-time
+// Read path. Returns nil if direct reading is not possible (e.g.
+// chunk-based or compressed files).
+// openDirect returns an io.Reader for a file's data that reads directly
+// from the underlying metadata reader, bypassing the block-at-a-time
+// Read path. Returns nil if direct reading is not possible.
+func (img *image) openDirect(fi *fileInfo) io.Reader {
+	if fi.size <= 0 {
+		return nil
+	}
+	blockSize := int64(1 << img.sb.BlkSizeBits)
+	switch fi.inodeLayout {
+	case disk.LayoutFlatPlain:
+		// Data is contiguous starting at dataBlkAddr.
+		dataOffset := int64(fi.inodeData) << img.sb.BlkSizeBits
+		return io.NewSectionReader(img.meta, dataOffset, fi.size)
+	case disk.LayoutFlatInline:
+		// Last block is inline after the inode; earlier blocks at dataBlkAddr.
+		// Only use direct read for single-block files (all data inline).
+		if fi.size > blockSize {
+			return nil
+		}
+		inodeAddr := img.metaStartPos() + int64(fi.nid)*disk.SizeInodeCompact
+		trailingAddr := inodeAddr + fi.flatDataOffset()
+		return io.NewSectionReader(img.meta, trailingAddr, fi.size)
+	case disk.LayoutChunkBased:
+		// Chunk-based files store data at the physical block addresses
+		// listed in the chunk index. For contiguous single-device files,
+		// the data is laid out consecutively and can be read directly.
+		chunkFmt := uint16(fi.inodeData)
+		if chunkFmt&disk.LayoutChunkFormatIndexes == 0 {
+			return nil
+		}
+		chunkBits := img.sb.BlkSizeBits + uint8(chunkFmt&disk.LayoutChunkFormatBits)
+		nchunks := int((fi.size-1)>>chunkBits) + 1
+
+		// Read chunk index entries to check contiguity.
+		inodeStart := img.metaStartPos() + int64(fi.nid)*disk.SizeInodeCompact
+		baseOffset := inodeStart + fi.flatDataOffset()
+		if baseOffset%8 != 0 {
+			baseOffset = (baseOffset + 7) & ^int64(7)
+		}
+		needed := int64(nchunks * disk.SizeChunkIndex)
+		idxBuf := make([]byte, needed)
+		if _, err := img.meta.ReadAt(idxBuf, baseOffset); err != nil {
+			return nil
+		}
+
+		// Check that all chunks are contiguous on the same device.
+		var startBlock uint64
+		var deviceID uint16
+		for i := range nchunks {
+			off := i * disk.SizeChunkIndex
+			blkLo := binary.LittleEndian.Uint32(idxBuf[off+4 : off+8])
+			if ^blkLo == 0 {
+				return nil // hole
+			}
+			blkHi := binary.LittleEndian.Uint16(idxBuf[off : off+2])
+			did := binary.LittleEndian.Uint16(idxBuf[off+2:off+4]) & img.deviceIDMask
+			phys := (uint64(blkHi) << 32) | uint64(blkLo)
+
+			blocksPerChunk := uint64(1 << (chunkBits - img.sb.BlkSizeBits))
+			if i == 0 {
+				startBlock = phys
+				deviceID = did
+			} else {
+				expected := startBlock + uint64(i)*blocksPerChunk
+				if phys != expected || did != deviceID {
+					return nil // not contiguous or different device
+				}
+			}
+		}
+
+		// All chunks contiguous — resolve through the device.
+		dataOffset := int64(startBlock) << img.sb.BlkSizeBits
+		if deviceID > 0 && int(deviceID) <= len(img.devices) {
+			return io.NewSectionReader(img.devices[deviceID-1].device, dataOffset, fi.size)
+		}
+		return io.NewSectionReader(img.meta, dataOffset, fi.size)
+	default:
+		return nil
+	}
 }
 
 func (img *image) readMetadata(r io.Reader) ([]byte, error) {
