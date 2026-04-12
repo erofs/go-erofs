@@ -46,13 +46,24 @@ var (
 	ErrLoop = fmt.Errorf("too many symlinks: %w", ErrInvalid)
 )
 
-// Stat is the erofs specific stat data returned by Stat and FileInfo requests
+// Stat is the raw erofs stat data returned by Sys() on [fs.FileInfo] values.
+// It is a plain data struct analogous to [syscall.Stat_t].
+//
+// For cross-platform fs.FS compatibility, callers should prefer
+// type-asserting the [fs.FileInfo] to accessor interfaces rather
+// than inspecting Stat fields directly. The returned [fs.FileInfo]
+// implements the following single-method interfaces:
+//
+//	Ownership:  UID() uint32, GID() uint32
+//	InodeInfo:  Ino() uint64, Nlink() uint64
+//	DeviceInfo: Rdev() uint64
+//	Xattrs:     GetAllXattr() map[string]string, GetXattr(string) (string, bool)
 type Stat struct {
 	Mode        fs.FileMode
 	Size        int64
 	InodeLayout uint8
 	Rdev        uint32
-	Inode       int64
+	Ino         int64
 	UID         uint32
 	GID         uint32
 	Mtime       uint64
@@ -302,7 +313,7 @@ func (img *image) loadLongPrefixes() error {
 			}
 
 			// Read inode info to determine size and layout
-			fi, err := f.readInfo(false)
+			fi, err := f.readInfo()
 			if err != nil {
 				img.prefixesErr = fmt.Errorf("failed to read packed inode: %w", err)
 				return
@@ -375,7 +386,7 @@ func (img *image) loadAt(addr, size int64) (*block, error) {
 }
 
 // loadBlock loads the block with the given data
-func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
+func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 	nblocks := calculateBlocks(img.sb.BlkSizeBits, fi.size)
 	bn := int(pos >> int(img.sb.BlkSizeBits))
 	if bn >= nblocks {
@@ -502,6 +513,9 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 		}
 		addr = mappedAddr
 
+		if blockOffset < 0 || blockEnd > blockSize || blockOffset >= blockEnd {
+			return nil, fmt.Errorf("invalid chunk block bounds [%d:%d] for nid %d: %w", blockOffset, blockEnd, fi.nid, ErrInvalid)
+		}
 		b := img.getBlock()
 		if n, err := reader.ReadAt(b.buf[blockOffset:blockEnd], addr+int64(blockOffset)); err != nil {
 			img.putBlock(b)
@@ -518,8 +532,8 @@ func (img *image) loadBlock(fi *fileInfo, pos int64) (*block, error) {
 	default:
 		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrInvalid)
 	}
-	if blockOffset >= blockEnd {
-		return nil, fmt.Errorf("no remaining items in block: %w", io.EOF)
+	if blockOffset < 0 || blockEnd > blockSize || blockOffset >= blockEnd {
+		return nil, fmt.Errorf("invalid block bounds [%d:%d] for nid %d: %w", blockOffset, blockEnd, fi.nid, ErrInvalid)
 	}
 
 	b := img.getBlock()
@@ -554,7 +568,7 @@ const maxSymlinkSize = 4096
 // readLink reads the symlink target for the given nid.
 func (i *image) readLink(nid uint64, name string) (string, error) {
 	f := &file{img: i, name: name, nid: nid, ftype: fs.ModeSymlink}
-	fi, err := f.readInfo(false)
+	fi, err := f.readInfo()
 	if err != nil {
 		return "", err
 	}
@@ -692,7 +706,7 @@ func (i *image) Stat(name string) (fs.FileInfo, error) {
 		return nil, err
 	}
 	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
-	return f.readInfo(true)
+	return f.statInfo()
 }
 
 // ReadFile reads the named file and returns its contents.
@@ -707,7 +721,7 @@ func (i *image) ReadFile(name string) ([]byte, error) {
 		return nil, &fs.PathError{Op: "read", Path: name, Err: ErrIsDirectory}
 	}
 	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
-	fi, err := f.readInfo(false)
+	fi, err := f.readInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -759,7 +773,7 @@ func (i *image) Lstat(name string) (fs.FileInfo, error) {
 		return nil, err
 	}
 	f := &file{img: i, name: basename, nid: nid, ftype: ftype}
-	return f.readInfo(true)
+	return f.statInfo()
 }
 
 type file struct {
@@ -769,11 +783,11 @@ type file struct {
 	ftype fs.FileMode
 
 	// Mutable fields, open file should not be accessed concurrently
-	offset int64     // current offset for read operations
-	info   *fileInfo // cached fileInfo
+	offset int64  // current offset for read operations
+	info   *inode // cached inode
 }
 
-func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
+func (b *file) readInfo() (ino *inode, err error) {
 	if b.info != nil {
 		return b.info, nil
 	}
@@ -801,80 +815,60 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 
 	}()
 
-	ino := blk.bytes()
-	_, err = b.img.meta.ReadAt(ino, addr)
+	buf := blk.bytes()
+	_, err = b.img.meta.ReadAt(buf, addr)
 	if err != nil {
 		return nil, err
 	}
 
 	var format, xcnt uint16
-	if _, err = binary.Decode(ino[:2], binary.LittleEndian, &format); err != nil {
+	if _, err = binary.Decode(buf[:2], binary.LittleEndian, &format); err != nil {
 		return nil, err
 	}
 
 	layout := uint8((format & 0x0E) >> 1)
 	if format&0x01 == 0 {
-		var inode disk.InodeCompact
-		if _, err := binary.Decode(ino[:disk.SizeInodeCompact], binary.LittleEndian, &inode); err != nil {
+		var di disk.InodeCompact
+		if _, err := binary.Decode(buf[:disk.SizeInodeCompact], binary.LittleEndian, &di); err != nil {
 			return nil, err
 		}
-		b.info = &fileInfo{
+		b.info = &inode{
 			name:        b.name,
 			nid:         b.nid,
 			icsize:      disk.SizeInodeCompact,
 			inodeLayout: layout,
-			inodeData:   inode.InodeData,
-			size:        int64(inode.Size),
-			mode:        (fs.FileMode(inode.Mode) & ^fs.ModeType) | b.ftype,
-			modTime:     time.Unix(int64(b.img.sb.BuildTime), int64(b.img.sb.BuildTimeNs)),
+			inodeData:   di.InodeData,
+			size:        int64(di.Size),
+			mode:        (fs.FileMode(di.Mode) & ^fs.ModeType) | b.ftype,
+			rawMode:     di.Mode,
+			uid:         uint32(di.UID),
+			gid:         uint32(di.GID),
+			nlink:       int(di.Nlink),
+			mtime:       b.img.sb.BuildTime,
+			mtimeNs:     b.img.sb.BuildTimeNs,
 		}
-		xcnt = inode.XattrCount
-		if infoOnly {
-			b.info.stat = &Stat{
-				Mode:        disk.EroFSModeToGoFileMode(inode.Mode),
-				Size:        int64(inode.Size),
-				InodeLayout: layout,
-				Inode:       int64(b.nid),
-				Rdev:        disk.RdevFromMode(inode.Mode, inode.InodeData),
-				UID:         uint32(inode.UID),
-				GID:         uint32(inode.GID),
-				Nlink:       int(inode.Nlink),
-				Mtime:       b.img.sb.BuildTime,
-				MtimeNs:     b.img.sb.BuildTimeNs,
-			}
-		}
-		addr += disk.SizeInodeCompact
+		xcnt = di.XattrCount
 	} else {
-		var inode disk.InodeExtended
-		if _, err = binary.Decode(ino[:disk.SizeInodeExtended], binary.LittleEndian, &inode); err != nil {
+		var di disk.InodeExtended
+		if _, err = binary.Decode(buf[:disk.SizeInodeExtended], binary.LittleEndian, &di); err != nil {
 			return nil, err
 		}
-		b.info = &fileInfo{
+		b.info = &inode{
 			name:        b.name,
 			nid:         b.nid,
 			icsize:      disk.SizeInodeExtended,
 			inodeLayout: layout,
-			inodeData:   inode.InodeData,
-			size:        int64(inode.Size),
-			mode:        (fs.FileMode(inode.Mode) & ^fs.ModeType) | b.ftype,
-			modTime:     time.Unix(int64(inode.Mtime), int64(inode.MtimeNs)),
+			inodeData:   di.InodeData,
+			size:        int64(di.Size),
+			mode:        (fs.FileMode(di.Mode) & ^fs.ModeType) | b.ftype,
+			rawMode:     di.Mode,
+			uid:         di.UID,
+			gid:         di.GID,
+			nlink:       int(di.Nlink),
+			mtime:       di.Mtime,
+			mtimeNs:     di.MtimeNs,
 		}
-		xcnt = inode.XattrCount
-		if infoOnly {
-			b.info.stat = &Stat{
-				Mode:        disk.EroFSModeToGoFileMode(inode.Mode),
-				Size:        int64(inode.Size),
-				InodeLayout: layout,
-				Inode:       int64(b.nid),
-				Rdev:        disk.RdevFromMode(inode.Mode, inode.InodeData),
-				UID:         inode.UID,
-				GID:         inode.GID,
-				Nlink:       int(inode.Nlink),
-				Mtime:       inode.Mtime,
-				MtimeNs:     inode.MtimeNs,
-			}
-		}
-		addr += disk.SizeInodeExtended
+		xcnt = di.XattrCount
 	}
 
 	if xcnt > 0 {
@@ -882,11 +876,7 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 	}
 
 	switch {
-	case infoOnly && b.info.xsize > 0:
-		if err = setXattrs(b, addr, blk); err != nil {
-			return nil, err
-		}
-	case infoOnly || b.info.inodeLayout == disk.LayoutFlatPlain || b.info.size == 0 || blk.end != blkSize:
+	case b.info.inodeLayout == disk.LayoutFlatPlain || b.info.size == 0 || blk.end != blkSize:
 		b.img.putBlock(blk)
 	default:
 		// If the inode has trailing data used later, cache it
@@ -895,12 +885,52 @@ func (b *file) readInfo(infoOnly bool) (fi *fileInfo, err error) {
 	return b.info, nil
 }
 
+// statInfo reads the inode and builds a fileInfo with full stat data
+// including extended attributes. The cached block is released since
+// stat callers do not need inline data.
+func (b *file) statInfo() (*fileInfo, error) {
+	ino, err := b.readInfo()
+	if err != nil {
+		return nil, err
+	}
+	fi := &fileInfo{
+		name:    ino.name,
+		size:    ino.size,
+		mode:    ino.mode,
+		mtime:   ino.mtime,
+		mtimeNs: ino.mtimeNs,
+		stat: &Stat{
+			Mode:        disk.EroFSModeToGoFileMode(ino.rawMode),
+			Size:        ino.size,
+			InodeLayout: ino.inodeLayout,
+			Ino:         int64(ino.nid),
+			Rdev:        disk.RdevFromMode(ino.rawMode, ino.inodeData),
+			UID:         ino.uid,
+			GID:         ino.gid,
+			Nlink:       ino.nlink,
+			Mtime:       ino.mtime,
+			MtimeNs:     ino.mtimeNs,
+		},
+	}
+	if ino.xsize > 0 {
+		if err := loadXattrs(b, fi.stat); err != nil {
+			return nil, err
+		}
+	}
+	// Release cached block - stat callers don't need inline data
+	if ino.cached != nil {
+		b.img.putBlock(ino.cached)
+		ino.cached = nil
+	}
+	return fi, nil
+}
+
 func (b *file) Stat() (fs.FileInfo, error) {
-	return b.readInfo(true)
+	return b.statInfo()
 }
 
 func (b *file) Read(p []byte) (int, error) {
-	fi, err := b.readInfo(false)
+	fi, err := b.readInfo()
 	if err != nil {
 		return 0, err
 	}
@@ -954,7 +984,7 @@ func (d *direntry) Type() fs.FileMode {
 }
 
 func (d *direntry) Info() (fs.FileInfo, error) {
-	return d.readInfo(true)
+	return d.statInfo()
 }
 
 type dir struct {
@@ -968,7 +998,7 @@ type dir struct {
 }
 
 func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
-	fi, err := d.readInfo(false)
+	fi, err := d.readInfo()
 	if err != nil {
 		return nil, fmt.Errorf("readInfo failed: %w", err)
 	}
@@ -1086,7 +1116,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 // intra-block binary search finds the entry.
 // Returns the nid and file type if found, or fs.ErrNotExist if not.
 func (d *dir) lookup(target string) (uint64, fs.FileMode, error) {
-	fi, err := d.readInfo(false)
+	fi, err := d.readInfo()
 	if err != nil {
 		return 0, 0, fmt.Errorf("readInfo failed: %w", err)
 	}
@@ -1257,7 +1287,9 @@ func lookupBlock(buf, target []byte) (uint64, fs.FileMode, error) {
 	return 0, 0, fs.ErrNotExist
 }
 
-type fileInfo struct {
+// inode holds the parsed on-disk inode data needed for I/O operations.
+// It is an internal type and is not returned to callers directly.
+type inode struct {
 	name        string
 	nid         uint64
 	icsize      int8
@@ -1266,38 +1298,53 @@ type fileInfo struct {
 	inodeData   uint32
 	size        int64
 	mode        fs.FileMode
-	modTime     time.Time
-	stat        *Stat
+	rawMode     uint16
+	uid         uint32
+	gid         uint32
+	nlink       int
+	mtime       uint64
+	mtimeNs     uint32
 	cached      *block
 }
 
-func (fi *fileInfo) Name() string {
-	return fi.name
-}
-
-func (fi *fileInfo) Size() int64 {
-	return fi.size
-}
-
-func (fi *fileInfo) Mode() fs.FileMode {
-	return fi.mode
-}
-func (fi *fileInfo) ModTime() time.Time {
-	return fi.modTime
-}
-
-func (fi *fileInfo) IsDir() bool {
-	return fi.mode.IsDir()
-}
-
-func (fi *fileInfo) Sys() any {
-	// Return erofs stat object with extra fields and call for xattrs
-	return fi.stat
-}
-
-func (fi *fileInfo) flatDataOffset() int64 {
+func (ino *inode) flatDataOffset() int64 {
 	// inode core size + xattr size
-	return int64(fi.icsize) + int64(fi.xsize)
+	return int64(ino.icsize) + int64(ino.xsize)
+}
+
+// fileInfo implements [fs.FileInfo] and provides extended metadata
+// via type-assertable accessor methods. Callers can extract
+// Unix-style metadata without importing this package:
+//
+//	if u, ok := fi.(interface{ UID() uint32 }); ok { uid = u.UID() }
+type fileInfo struct {
+	name    string
+	size    int64
+	mode    fs.FileMode
+	mtime   uint64
+	mtimeNs uint32
+	stat    *Stat
+}
+
+func (fi *fileInfo) Name() string       { return fi.name }
+func (fi *fileInfo) Size() int64        { return fi.size }
+func (fi *fileInfo) Mode() fs.FileMode  { return fi.mode }
+func (fi *fileInfo) IsDir() bool        { return fi.mode.IsDir() }
+func (fi *fileInfo) Sys() any           { return fi.stat }
+func (fi *fileInfo) ModTime() time.Time { return time.Unix(int64(fi.mtime), int64(fi.mtimeNs)) }
+func (fi *fileInfo) UID() uint32        { return fi.stat.UID }
+func (fi *fileInfo) GID() uint32        { return fi.stat.GID }
+func (fi *fileInfo) Ino() uint64        { return uint64(fi.stat.Ino) }
+func (fi *fileInfo) Nlink() uint64      { return uint64(fi.stat.Nlink) }
+func (fi *fileInfo) Rdev() uint64       { return uint64(fi.stat.Rdev) }
+
+// GetAllXattr returns all extended attributes.
+func (fi *fileInfo) GetAllXattr() map[string]string { return fi.stat.Xattrs }
+
+// GetXattr returns the value of a single extended attribute.
+func (fi *fileInfo) GetXattr(name string) (string, bool) {
+	v, ok := fi.stat.Xattrs[name]
+	return v, ok
 }
 func decodeSuperBlock(b [disk.SizeSuperBlock]byte, sb *disk.SuperBlock) error {
 	n, err := binary.Decode(b[:], binary.LittleEndian, sb)
