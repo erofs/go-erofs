@@ -85,3 +85,30 @@ func Stat(t testing.TB, fsys fs.FS, name string) *erofs.Stat {
 	}
 	return st
 }
+
+// lstatFS is the interface for Lstat only, without requiring ReadLink.
+type lstatFS interface {
+	Lstat(name string) (fs.FileInfo, error)
+}
+
+// Lstat returns the *erofs.Stat for the named path without following symlinks,
+// or calls t.Fatal if it cannot be obtained.
+func Lstat(t testing.TB, fsys fs.FS, name string) *erofs.Stat {
+	t.Helper()
+
+	lfs, ok := fsys.(lstatFS)
+	if !ok {
+		t.Fatalf("FS does not implement Lstat")
+	}
+
+	fi, err := lfs.Lstat(name)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", name, err)
+	}
+
+	st, ok := fi.Sys().(*erofs.Stat)
+	if !ok {
+		t.Fatalf("%s: expected *erofs.Stat from Sys(), got %T", name, fi.Sys())
+	}
+	return st
+}

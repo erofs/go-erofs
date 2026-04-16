@@ -29,6 +29,7 @@ func TestErofs(t *testing.T) {
 	}{
 		{"Basic", erofstest.Basic, nil},
 		{"FileSizes", erofstest.FileSizes, nil},
+		{"UIDGIDValues", erofstest.UIDGIDValues, nil},
 		{"LongXattrs", erofstest.LongXattrs, erofstest.XattrPrefixFlags()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

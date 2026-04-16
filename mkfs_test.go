@@ -1387,3 +1387,92 @@ func TestMergeWhiteoutDir(t *testing.T) {
 	erofstest.CheckNotExists(t, efs, "dir")
 	erofstest.CheckNotExists(t, efs, "dir/file.txt")
 }
+
+// TestCreateFSUIDGID tests a variety of UID/GID values including boundary
+// values for compact (uint16) and extended (uint32) inodes.
+func TestCreateFSUIDGID(t *testing.T) {
+	type uidgid struct {
+		uid, gid int
+	}
+	cases := []uidgid{
+		{0, 0},
+		{1, 1},
+		{1000, 2000},
+		{65534, 65534}, // nobody/nogroup on many systems
+		{65535, 65535}, // max compact inode UID/GID
+		{65536, 65536}, // first value requiring extended inode
+		{100000, 100000},
+		{0, 65536}, // mixed: compact-range UID, extended-range GID
+		{65536, 0}, // mixed: extended-range UID, compact-range GID
+		{0x7FFFFFFF, 0x7FFFFFFF},
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("uid%d_gid%d", tc.uid, tc.gid), func(t *testing.T) {
+			var buf testBuffer
+			fsys := erofs.Create(&buf)
+
+			// Test UID/GID on a regular file via File.Chown.
+			f, err := fsys.Create("/file.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.Write([]byte("hello")); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Chown(tc.uid, tc.gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Test UID/GID on a directory via Writer.Chown.
+			if err := fsys.Mkdir("/dir", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := fsys.Chown("/dir", tc.uid, tc.gid); err != nil {
+				t.Fatal(err)
+			}
+
+			// Test UID/GID on a symlink.
+			if err := fsys.Symlink("file.txt", "/link"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fsys.Chown("/link", tc.uid, tc.gid); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := fsys.Close(); err != nil {
+				t.Fatal("Close:", err)
+			}
+
+			erofstest.FsckErofsBytes(t, buf.Bytes())
+			efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatal("Open:", err)
+			}
+
+			wantUID := uint32(tc.uid)
+			wantGID := uint32(tc.gid)
+
+			// Verify file UID/GID.
+			st := erofstest.Stat(t, efs, "file.txt")
+			if st.UID != wantUID || st.GID != wantGID {
+				t.Errorf("file uid/gid: got %d/%d, want %d/%d", st.UID, st.GID, wantUID, wantGID)
+			}
+
+			// Verify directory UID/GID.
+			dst := erofstest.Stat(t, efs, "dir")
+			if dst.UID != wantUID || dst.GID != wantGID {
+				t.Errorf("dir uid/gid: got %d/%d, want %d/%d", dst.UID, dst.GID, wantUID, wantGID)
+			}
+
+			// Verify symlink UID/GID.
+			lst := erofstest.Lstat(t, efs, "link")
+			if lst.UID != wantUID || lst.GID != wantGID {
+				t.Errorf("symlink uid/gid: got %d/%d, want %d/%d", lst.UID, lst.GID, wantUID, wantGID)
+			}
+		})
+	}
+}
