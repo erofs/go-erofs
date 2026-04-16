@@ -363,6 +363,66 @@ var LargeFile TestCase = &testCase{
 	},
 }
 
+// uidgidTestValues is the shared set of UID/GID pairs tested by
+// UIDGIDValues. Defined once to avoid drift between tar creation and
+// verification.
+var uidgidTestValues = []struct{ uid, gid int }{
+	{0, 0},
+	{1, 1},
+	{1000, 2000},
+	{65534, 65534}, // nobody/nogroup
+	{65535, 65535}, // max compact inode (uint16)
+	{65536, 65536}, // first extended inode value
+	{100000, 100000},
+	{0, 65536}, // compact UID, extended GID
+	{65536, 0}, // extended UID, compact GID
+	{0x7FFFFFFF, 0x7FFFFFFF},
+}
+
+// UIDGIDValues tests a variety of UID/GID values including boundary values
+// for compact (uint16) and extended (uint32) inodes. Each value is tested
+// on a regular file, directory, and symlink.
+var UIDGIDValues TestCase = &testCase{
+	tar: func() WriterToTar {
+		base := TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+		var entries []WriterToTar
+		for _, id := range uidgidTestValues {
+			tc := base.WithUIDGID(id.uid, id.gid)
+			prefix := fmt.Sprintf("/id-%d-%d", id.uid, id.gid)
+			entries = append(entries,
+				tc.Dir(prefix, 0755),
+				tc.File(prefix+"/file.txt", []byte("hello"), 0644),
+				tc.Dir(prefix+"/dir", 0755),
+				tc.Symlink("file.txt", prefix+"/link"),
+			)
+		}
+		return TarAll(entries...)
+	},
+	verify: func(t testing.TB, fsys fs.FS) {
+		t.Helper()
+		for _, id := range uidgidTestValues {
+			prefix := fmt.Sprintf("id-%d-%d", id.uid, id.gid)
+			wantUID := uint32(id.uid)
+			wantGID := uint32(id.gid)
+
+			st := Stat(t, fsys, prefix+"/file.txt")
+			if st.UID != wantUID || st.GID != wantGID {
+				t.Errorf("%s/file.txt uid/gid: got %d/%d, want %d/%d", prefix, st.UID, st.GID, wantUID, wantGID)
+			}
+
+			dst := Stat(t, fsys, prefix+"/dir")
+			if dst.UID != wantUID || dst.GID != wantGID {
+				t.Errorf("%s/dir uid/gid: got %d/%d, want %d/%d", prefix, dst.UID, dst.GID, wantUID, wantGID)
+			}
+
+			lst := Lstat(t, fsys, prefix+"/link")
+			if lst.UID != wantUID || lst.GID != wantGID {
+				t.Errorf("%s/link uid/gid: got %d/%d, want %d/%d", prefix, lst.UID, lst.GID, wantUID, wantGID)
+			}
+		}
+	},
+}
+
 // generateContent produces deterministic bytes: each byte is i % 251.
 func generateContent(size int) []byte {
 	data := make([]byte, size)
