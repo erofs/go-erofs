@@ -7,6 +7,15 @@
 #include <stdio.h>
 #include <errno.h>
 /*
+ * MinGW-w64 defines uid_t/gid_t as 'short' (signed 16-bit), which
+ * truncates values >= 32768 and sign-extends them when promoted to
+ * 32-bit.  Override with macros so all subsequent code (including
+ * erofs-utils internal structs) sees 32-bit unsigned types, matching
+ * the Linux EROFS on-disk format.
+ */
+#define uid_t unsigned int
+#define gid_t unsigned int
+/*
  * MinGW-w64 honours _FILE_OFFSET_BITS=64 for off_t (making it 64-bit),
  * but does NOT remap lseek/ftruncate to their 64-bit variants the way
  * glibc does on Linux.  Provide the remapping here so every call site
