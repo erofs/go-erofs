@@ -538,15 +538,18 @@ func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 			// Move to the data offset from the start of the inode
 			addr += fi.flatDataOffset()
 
-			// Get the ooffset from the start of the block
+			// Get the offset from the start of the block
 			blockOffset = int(addr & int64(blockSize-1))
 
 			// Move addr to start of block
 			addr = (addr & ^int64(blockSize-1))
 
+			// Compute end of inline data within the block (before adjusting
+			// blockOffset for the read position).
+			blockEnd = int(fi.size-int64(bn*blockSize)) + blockOffset
+
 			// Move the offset within the block based on position within file
 			blockOffset += int(pos - int64(bn<<int(img.sb.BlkSizeBits)))
-			blockEnd = int(fi.size-int64(bn*blockSize)) + blockOffset
 
 			// Ensure the last block is not exceeded
 			if blockEnd > blockSize {
