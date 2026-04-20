@@ -1476,3 +1476,92 @@ func TestCreateFSUIDGID(t *testing.T) {
 		})
 	}
 }
+
+// TestCopyFromStatSource verifies that CopyFrom preserves directory xattrs,
+// directory ownership, and file ownership when the source FS returns *Stat
+// from FileInfo.Sys() (the generic/EROFS reader path, not *builder.Entry).
+//
+// Before the fix, CopyFrom fell through to add(p, info) for directories
+// and non-regular entries when be was extracted from *Stat, losing all
+// metadata because entryFromSys does not handle *Stat.
+func TestCopyFromStatSource(t *testing.T) {
+	// Build a source EROFS image with a directory that has xattrs and
+	// custom ownership, plus a file with custom ownership.
+	var srcBuf erofstest.TestBuffer
+	w := erofs.Create(&srcBuf)
+
+	if err := w.Mkdir("/", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Mkdir("/mydir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Setxattr("/mydir", "trusted.overlay.opaque", "y"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Setxattr("/mydir", "user.custom", "val"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Chown("/mydir", 1000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	f, err := w.Create("/mydir/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte("content"))
+	_ = f.Close()
+	if err := w.Chown("/mydir/file.txt", 2000, 2000); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open the source EROFS — Sys() returns *erofs.Stat, not *builder.Entry.
+	srcFS, err := erofs.Open(bytes.NewReader(srcBuf.Bytes()))
+	if err != nil {
+		t.Fatal("open source:", err)
+	}
+
+	// CopyFrom into a new Writer (non-MetadataOnly → uses WalkDir path).
+	var dstBuf erofstest.TestBuffer
+	w2 := erofs.Create(&dstBuf)
+	if err := w2.CopyFrom(srcFS); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	// Open the destination and verify metadata survived the round-trip.
+	dstFS, err := erofs.Open(bytes.NewReader(dstBuf.Bytes()))
+	if err != nil {
+		t.Fatal("open dest:", err)
+	}
+
+	// Directory xattrs must be preserved.
+	erofstest.CheckXattrs(t, dstFS, "mydir", map[string]string{
+		"trusted.overlay.opaque": "y",
+		"user.custom":            "val",
+	})
+
+	// Directory ownership must be preserved.
+	dirSt := erofstest.Stat(t, dstFS, "mydir")
+	if dirSt.UID != 1000 {
+		t.Errorf("mydir UID = %d, want 1000", dirSt.UID)
+	}
+	if dirSt.GID != 1000 {
+		t.Errorf("mydir GID = %d, want 1000", dirSt.GID)
+	}
+
+	// File content and ownership must be preserved.
+	erofstest.CheckFile(t, dstFS, "mydir/file.txt", "content")
+	fileSt := erofstest.Stat(t, dstFS, "mydir/file.txt")
+	if fileSt.UID != 2000 {
+		t.Errorf("file.txt UID = %d, want 2000", fileSt.UID)
+	}
+	if fileSt.GID != 2000 {
+		t.Errorf("file.txt GID = %d, want 2000", fileSt.GID)
+	}
+}
