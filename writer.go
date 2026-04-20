@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/erofs/go-erofs/internal/builder"
 	"github.com/erofs/go-erofs/internal/disk"
 )
 
@@ -476,6 +477,8 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 	if len(e.chunks) > 0 {
 		// Walk source chunks and emit one index per logical chunk.
 		// Source chunks use block-granularity counts; we step by blocksPerChunk.
+		// A chunk with PhysicalBlock == builder.NullPhysicalBlock is a hole:
+		// emit nullIdx entries for its block span.
 		var scratch [disk.SizeChunkIndex]byte
 		ci := 0   // index into source chunks
 		coff := 0 // block offset within current source chunk
@@ -487,12 +490,19 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 				continue
 			}
 			c := e.chunks[ci]
-			phys := c.PhysicalBlock + uint64(coff)
-			binary.LittleEndian.PutUint16(scratch[0:2], uint16(phys>>32))
-			binary.LittleEndian.PutUint16(scratch[2:4], c.DeviceID)
-			binary.LittleEndian.PutUint32(scratch[4:8], uint32(phys))
-			if _, err := buf.Write(scratch[:]); err != nil {
-				return err
+			if c.PhysicalBlock == builder.NullPhysicalBlock {
+				// Hole chunk: emit a null index entry.
+				if _, err := buf.Write(nullIdx[:]); err != nil {
+					return err
+				}
+			} else {
+				phys := c.PhysicalBlock + uint64(coff)
+				binary.LittleEndian.PutUint16(scratch[0:2], uint16(phys>>32))
+				binary.LittleEndian.PutUint16(scratch[2:4], c.DeviceID)
+				binary.LittleEndian.PutUint32(scratch[4:8], uint32(phys))
+				if _, err := buf.Write(scratch[:]); err != nil {
+					return err
+				}
 			}
 			coff += blocksPerChunk
 			for ci < len(e.chunks) && coff >= int(e.chunks[ci].Count) {

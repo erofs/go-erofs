@@ -483,6 +483,22 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 						be = &builder.Entry{}
 					}
 				}
+				// Generate chunks from DataRange if available.
+				if len(be.Chunks) == 0 {
+					if dr, ok := info.(dataRanger); ok {
+						if ranges := dr.DataRange(); len(ranges) > 0 {
+							chunks, err := fsys.chunksFromRanges(ranges, info.Size())
+							if err != nil {
+								return fmt.Errorf("chunksFromRanges %s: %w", p, err)
+							}
+							be.Chunks = chunks
+							// Contiguous: a single non-hole range whose total-size
+							// invariant is satisfied (guaranteed by chunksFromRanges)
+							// means the file is fully covered by one contiguous extent.
+							be.Contiguous = len(ranges) == 1 && ranges[0].Offset != holeOffset
+						}
+					}
+				}
 				return fsys.add(p, &entryFileInfo{info: info, sys: be})
 			}
 			// For EROFS sources, use direct SectionReader (bypasses
@@ -794,6 +810,21 @@ type deviceBlocker interface {
 // readLinker is an interface for filesystems that support reading symlink targets.
 type readLinker interface {
 	ReadLink(name string) (string, error)
+}
+
+// dataRanger may be implemented by fs.FileInfo to provide the physical
+// location of uncompressed file data in backing devices. CopyFrom checks
+// this via type assertion in metadata-only mode to build chunk indexes
+// without requiring the caller to construct internal chunk types.
+//
+// This interface should only be implemented for files whose device data
+// is stored verbatim (uncompressed). For compressed files, return nil or
+// do not implement the interface. In full-image mode CopyFrom then falls
+// back to reading through Open(), which decompresses transparently. In
+// MetadataOnly mode there is no such fallback: the file is stored as a
+// chunk-based inode with no physical mappings (all holes).
+type dataRanger interface {
+	DataRange() []DataRange
 }
 
 // --- Internal types ---
@@ -1327,6 +1358,95 @@ func (fsys *Writer) zeroPad() []byte {
 		fsys.padBuf = make([]byte, fsys.resolveBlockSize())
 	}
 	return fsys.padBuf
+}
+
+// chunksFromRanges converts DataRange entries into internal chunk entries.
+// fileSize is the logical size of the file; the sum of all range Sizes must
+// equal fileSize exactly, or an error is returned.
+//
+// The block size used is the Writer's resolved block size. DataRange.Device
+// values are offset by 1 to produce chunk DeviceIDs: DataRange Device 0
+// becomes chunk DeviceID 1 (the first extra device), matching the EROFS
+// convention where DeviceID 0 is the primary image.
+//
+// Validation rules:
+//   - sum(Size) == fileSize; a mismatch is rejected.
+//   - r.Size > 0 for every entry.
+//   - Hole entries (Offset == -1) emit [builder.NullPhysicalBlock] chunks.
+//     Hole Size must be block-aligned for non-final entries; the final entry
+//     may end mid-block to match the file tail.
+//   - For data entries: r.Offset >= 0 and block-aligned; r.Device == 0.
+//   - For non-final data entries: r.Size must be a multiple of blockSize.
+//     The final entry may have a partial last block to match the file tail.
+func (fsys *Writer) chunksFromRanges(ranges []DataRange, fileSize int64) ([]builder.Chunk, error) {
+	blockSize := uint64(fsys.resolveBlockSize())
+
+	// Validate total coverage first.
+	var total int64
+	for _, r := range ranges {
+		total += r.Size
+	}
+	if total != fileSize {
+		return nil, fmt.Errorf("DataRange total size %d does not match file size %d", total, fileSize)
+	}
+
+	last := len(ranges) - 1
+	var chunks []builder.Chunk
+	for i, r := range ranges {
+		if r.Size <= 0 {
+			return nil, fmt.Errorf("DataRange[%d]: non-positive Size %d", i, r.Size)
+		}
+		// Non-final entries must be block-aligned in size; the final entry may
+		// end mid-block to match the file tail.
+		if i < last && uint64(r.Size)%blockSize != 0 {
+			return nil, fmt.Errorf("DataRange[%d]: non-final Size %d is not block-aligned (block size %d)", i, r.Size, blockSize)
+		}
+		if r.Offset == holeOffset {
+			// Hole: emit NullPhysicalBlock chunks covering the hole span.
+			totalBlocks := (uint64(r.Size) + blockSize - 1) / blockSize
+			for totalBlocks > 0 {
+				count := totalBlocks
+				if count > 65535 {
+					count = 65535
+				}
+				chunks = append(chunks, builder.Chunk{
+					PhysicalBlock: builder.NullPhysicalBlock,
+					Count:         uint16(count),
+				})
+				totalBlocks -= count
+			}
+			continue
+		}
+		if r.Offset < 0 {
+			return nil, fmt.Errorf("DataRange[%d]: negative Offset %d", i, r.Offset)
+		}
+		if uint64(r.Offset)%blockSize != 0 {
+			return nil, fmt.Errorf("DataRange[%d]: Offset %d is not block-aligned (block size %d)", i, r.Offset, blockSize)
+		}
+		// Non-EROFS sources register exactly one device via DeviceBlocks();
+		// only Device=0 is valid. Device=0xFFFF would also wrap deviceID to 0
+		// (the primary image), producing an invalid mapping.
+		if r.Device != 0 {
+			return nil, fmt.Errorf("DataRange[%d]: Device %d out of range (source declared one device, only Device=0 is valid)", i, r.Device)
+		}
+		deviceID := r.Device + 1
+		startBlock := uint64(r.Offset) / blockSize
+		totalBlocks := (uint64(r.Size) + blockSize - 1) / blockSize
+		for totalBlocks > 0 {
+			count := totalBlocks
+			if count > 65535 {
+				count = 65535
+			}
+			chunks = append(chunks, builder.Chunk{
+				PhysicalBlock: startBlock,
+				Count:         uint16(count),
+				DeviceID:      deviceID,
+			})
+			startBlock += count
+			totalBlocks -= count
+		}
+	}
+	return chunks, nil
 }
 
 // ensureSpool lazily creates the spool temp file.
