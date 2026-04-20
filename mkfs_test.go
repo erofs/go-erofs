@@ -236,7 +236,7 @@ func TestCreateFSMknod(t *testing.T) {
 		t.Fatal("EroFS:", err)
 	}
 
-	erofstest.CheckDevice(t, efs, "null", fs.ModeCharDevice, 1<<8|3)
+	erofstest.CheckDevice(t, efs, "null", fs.ModeDevice|fs.ModeCharDevice, 1<<8|3)
 	erofstest.CheckDevice(t, efs, "sda", fs.ModeDevice, 8<<8) //nolint:staticcheck // minor=0
 }
 
@@ -1509,11 +1509,24 @@ func TestCopyFromStatSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = f.Write([]byte("content"))
-	_ = f.Close()
+	if _, err := f.Write([]byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.Chown("/mydir/file.txt", 2000, 2000); err != nil {
 		t.Fatal(err)
 	}
+
+	// Add a character device with custom ownership.
+	if err := w.Mknod("/mydir/null", disk.StatTypeChrdev|0o666, 1<<8|3); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Chown("/mydir/null", 3000, 3000); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1563,5 +1576,15 @@ func TestCopyFromStatSource(t *testing.T) {
 	}
 	if fileSt.GID != 2000 {
 		t.Errorf("file.txt GID = %d, want 2000", fileSt.GID)
+	}
+
+	// Device node metadata must be preserved.
+	erofstest.CheckDevice(t, dstFS, "mydir/null", fs.ModeDevice|fs.ModeCharDevice, 1<<8|3)
+	devSt := erofstest.Stat(t, dstFS, "mydir/null")
+	if devSt.UID != 3000 {
+		t.Errorf("null UID = %d, want 3000", devSt.UID)
+	}
+	if devSt.GID != 3000 {
+		t.Errorf("null GID = %d, want 3000", devSt.GID)
 	}
 }
