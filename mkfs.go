@@ -435,6 +435,15 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 						be = &builder.Entry{}
 					}
 				}
+				// Generate chunks from DataRange if available.
+				if len(be.Chunks) == 0 {
+					if dr, ok := info.(dataRanger); ok {
+						if ranges := dr.DataRange(); len(ranges) > 0 {
+							be.Chunks = fsys.chunksFromRanges(ranges)
+							be.Contiguous = len(ranges) == 1
+						}
+					}
+				}
 				return fsys.add(p, &entryFileInfo{info: info, sys: be})
 			}
 			// For EROFS sources, use direct SectionReader (bypasses
@@ -742,6 +751,19 @@ type deviceBlocker interface {
 // readLinker is an interface for filesystems that support reading symlink targets.
 type readLinker interface {
 	ReadLink(name string) (string, error)
+}
+
+// dataRanger may be implemented by fs.FileInfo to provide the physical
+// location of uncompressed file data in backing devices. CopyFrom checks
+// this via type assertion in metadata-only mode to build chunk indexes
+// without requiring the caller to construct internal chunk types.
+//
+// This interface should only be implemented for files whose device data
+// is stored verbatim (uncompressed). For compressed files, return nil or
+// do not implement the interface; CopyFrom will read through Open() which
+// handles decompression transparently.
+type dataRanger interface {
+	DataRange() []DataRange
 }
 
 // --- Internal types ---
@@ -1275,6 +1297,35 @@ func (fsys *Writer) zeroPad() []byte {
 		fsys.padBuf = make([]byte, fsys.resolveBlockSize())
 	}
 	return fsys.padBuf
+}
+
+// chunksFromRanges converts DataRange entries into internal chunk entries.
+// The block size used is the Writer's resolved block size. DataRange.Device
+// values are offset by 1 to produce chunk DeviceIDs: DataRange Device 0
+// becomes chunk DeviceID 1 (the first extra device), matching the EROFS
+// convention where DeviceID 0 is the primary image.
+func (fsys *Writer) chunksFromRanges(ranges []DataRange) []builder.Chunk {
+	blockSize := uint64(fsys.resolveBlockSize())
+	var chunks []builder.Chunk
+	for _, r := range ranges {
+		deviceID := r.Device + 1
+		startBlock := uint64(r.Offset) / blockSize
+		totalBlocks := (uint64(r.Size) + blockSize - 1) / blockSize
+		for totalBlocks > 0 {
+			count := totalBlocks
+			if count > 65535 {
+				count = 65535
+			}
+			chunks = append(chunks, builder.Chunk{
+				PhysicalBlock: startBlock,
+				Count:         uint16(count),
+				DeviceID:      deviceID,
+			})
+			startBlock += count
+			totalBlocks -= count
+		}
+	}
+	return chunks
 }
 
 // ensureSpool lazily creates the spool temp file.
