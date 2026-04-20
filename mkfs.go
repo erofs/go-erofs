@@ -485,11 +485,13 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			}
 		}
 
-		// For directories from plain fs.FS, ensure nlink >= 2.
-		if info.Mode().IsDir() && be == nil {
-			be = entryFromSys(info)
+		// For directories, ensure nlink >= 2.
+		if info.Mode().IsDir() {
 			if be == nil {
-				be = &builder.Entry{Nlink: 2}
+				be = entryFromSys(info)
+				if be == nil {
+					be = &builder.Entry{Nlink: 2}
+				}
 			}
 			if be.Nlink < 2 {
 				be.Nlink = 2
@@ -497,6 +499,12 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			return fsys.add(p, &entryFileInfo{info: info, sys: be})
 		}
 
+		// General case: devices, fifos, sockets, etc.
+		// Wrap in entryFileInfo when be was extracted from Sys()
+		// so that add() sees the metadata.
+		if be != nil {
+			return fsys.add(p, &entryFileInfo{info: info, sys: be})
+		}
 		return fsys.add(p, info)
 	})
 }
