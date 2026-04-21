@@ -101,9 +101,12 @@ jobs:
       - name: Fuzz
         run: |
           fuzz_time=10s
-          for target in $(go test -list 'Fuzz.*' . 2>/dev/null | grep '^Fuzz'); do
+          # Build the test binary once to avoid repeated compilation per target.
+          go test -c -o fuzz.test .
+          cache_dir=$(go env GOCACHE)/fuzz
+          for target in $(./fuzz.test -test.list 'Fuzz.*' 2>/dev/null | grep '^Fuzz'); do
             echo "::group::$target"
-            go test -fuzz="^${target}\$" -fuzztime=$fuzz_time -timeout=120s . && echo "PASS: $target" || exit 1
+            ./fuzz.test -test.fuzz="^${target}\$" -test.fuzztime=$fuzz_time -test.timeout=180s -test.fuzzcachedir="$cache_dir" && echo "PASS: $target" || exit 1
             echo "::endgroup::"
           done
 
