@@ -242,8 +242,8 @@ var Basic TestCase = &testCase{
 
 		CheckDevice(t, fsys, "dev/block0", fs.ModeDevice, 1)
 		CheckDevice(t, fsys, "dev/block1", fs.ModeDevice, 0)
-		CheckDevice(t, fsys, "dev/char0", fs.ModeCharDevice, 2)
-		CheckDevice(t, fsys, "dev/char1", fs.ModeCharDevice, 3)
+		CheckDevice(t, fsys, "dev/char0", fs.ModeDevice|fs.ModeCharDevice, 2)
+		CheckDevice(t, fsys, "dev/char1", fs.ModeDevice|fs.ModeCharDevice, 3)
 		CheckDevice(t, fsys, "dev/fifo0", fs.ModeNamedPipe, 0)
 
 		// Symlink targets.
