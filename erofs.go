@@ -97,6 +97,22 @@ type Stat struct {
 	Xattrs      map[string]string
 }
 
+// DataRange describes a contiguous region of uncompressed file data in a
+// backing device. It is used exclusively for data that can be referenced
+// by position without transformation — the bytes at [Offset, Offset+Size)
+// in the device are the file's content verbatim.
+//
+// Compressed data should not be represented as a DataRange. When a source
+// FS contains compressed files, it should not implement the dataRanger
+// interface for those files (or return nil). CopyFrom will fall back to
+// reading through Open(), which decompresses transparently, and write the
+// decompressed data into the output image.
+type DataRange struct {
+	Device uint16 // device index (0 for the device assigned by CopyFrom)
+	Offset int64  // byte offset in the device
+	Size   int64  // byte length
+}
+
 type options struct {
 	extraDevices []io.ReaderAt
 }
@@ -1047,12 +1063,94 @@ func (b *file) statInfo() (*fileInfo, error) {
 			return nil, err
 		}
 	}
+	// Build data ranges for regular files.
+	if ino.mode.IsRegular() && ino.size > 0 {
+		fi.dataRanges = b.buildDataRanges(ino)
+	}
 	// Release cached block - stat callers don't need inline data
 	if ino.cached != nil {
 		b.img.putBlock(ino.cached)
 		ino.cached = nil
 	}
 	return fi, nil
+}
+
+// buildDataRanges computes the physical data ranges for a regular file.
+func (b *file) buildDataRanges(ino *inode) []DataRange {
+	blockSize := int64(1 << b.img.sb.BlkSizeBits)
+	switch ino.inodeLayout {
+	case disk.LayoutFlatPlain:
+		dataOffset := int64(ino.inodeData) << b.img.sb.BlkSizeBits
+		return []DataRange{{Device: 0, Offset: dataOffset, Size: ino.size}}
+	case disk.LayoutFlatInline:
+		inodeAddr := b.img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
+		trailingAddr := inodeAddr + ino.flatDataOffset()
+		if ino.size <= blockSize {
+			return []DataRange{{Device: 0, Offset: trailingAddr, Size: ino.size}}
+		}
+		// Multi-block inline: earlier blocks at dataBlkAddr, last block inline.
+		headSize := int64(ino.inodeData) * blockSize
+		tailSize := ino.size - headSize
+		var ranges []DataRange
+		if headSize > 0 {
+			dataOffset := int64(ino.inodeData) << b.img.sb.BlkSizeBits
+			ranges = append(ranges, DataRange{Device: 0, Offset: dataOffset, Size: headSize})
+		}
+		ranges = append(ranges, DataRange{Device: 0, Offset: trailingAddr, Size: tailSize})
+		return ranges
+	case disk.LayoutChunkBased:
+		return b.buildChunkDataRanges(ino)
+	}
+	return nil
+}
+
+// buildChunkDataRanges parses chunk indexes into DataRange entries.
+func (b *file) buildChunkDataRanges(ino *inode) []DataRange {
+	chunkFmt := uint16(ino.inodeData)
+	if chunkFmt&disk.LayoutChunkFormatIndexes == 0 {
+		return nil
+	}
+	chunkBits := b.img.sb.BlkSizeBits + uint8(chunkFmt&disk.LayoutChunkFormatBits)
+	nchunks := int((ino.size-1)>>chunkBits) + 1
+	chunkSize := int64(1) << chunkBits
+
+	inodeStart := b.img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
+	baseOffset := inodeStart + ino.flatDataOffset()
+	if baseOffset%8 != 0 {
+		baseOffset = (baseOffset + 7) & ^int64(7)
+	}
+	needed := int64(nchunks * disk.SizeChunkIndex)
+	idxBuf := make([]byte, needed)
+	if _, err := b.img.meta.ReadAt(idxBuf, baseOffset); err != nil {
+		return nil
+	}
+
+	var ranges []DataRange
+	for i := range nchunks {
+		off := i * disk.SizeChunkIndex
+		blkHi := binary.LittleEndian.Uint16(idxBuf[off : off+2])
+		deviceID := binary.LittleEndian.Uint16(idxBuf[off+2:off+4]) & b.img.deviceIDMask
+		blkLo := binary.LittleEndian.Uint32(idxBuf[off+4 : off+8])
+		if ^blkLo == 0 {
+			continue // null/hole
+		}
+		phys := (uint64(blkHi) << 32) | uint64(blkLo)
+		byteOffset := int64(phys) << b.img.sb.BlkSizeBits
+		size := chunkSize
+		if i == nchunks-1 {
+			size = ino.size - int64(i)*chunkSize
+		}
+		// Merge with previous range if contiguous on same device.
+		if len(ranges) > 0 {
+			prev := &ranges[len(ranges)-1]
+			if prev.Device == deviceID && prev.Offset+prev.Size == byteOffset {
+				prev.Size += size
+				continue
+			}
+		}
+		ranges = append(ranges, DataRange{Device: deviceID, Offset: byteOffset, Size: size})
+	}
+	return ranges
 }
 
 func (b *file) Stat() (fs.FileInfo, error) {
@@ -1454,12 +1552,13 @@ func (ino *inode) flatDataOffset() int64 {
 //
 //	if u, ok := fi.(interface{ UID() uint32 }); ok { uid = u.UID() }
 type fileInfo struct {
-	name    string
-	size    int64
-	mode    fs.FileMode
-	mtime   uint64
-	mtimeNs uint32
-	stat    *Stat
+	name       string
+	size       int64
+	mode       fs.FileMode
+	mtime      uint64
+	mtimeNs    uint32
+	stat       *Stat
+	dataRanges []DataRange
 }
 
 func (fi *fileInfo) Name() string       { return fi.name }
@@ -1473,6 +1572,12 @@ func (fi *fileInfo) GID() uint32        { return fi.stat.GID }
 func (fi *fileInfo) Ino() uint64        { return uint64(fi.stat.Ino) }
 func (fi *fileInfo) Nlink() uint64      { return uint64(fi.stat.Nlink) }
 func (fi *fileInfo) Rdev() uint64       { return uint64(fi.stat.Rdev) }
+
+// DataRange returns the physical data ranges for this file's content.
+// DataRange returns the physical data ranges for this file's uncompressed
+// content. Returns nil for compressed files, directories, symlinks, and
+// other non-regular entries.
+func (fi *fileInfo) DataRange() []DataRange { return fi.dataRanges }
 
 // GetAllXattr returns all extended attributes.
 func (fi *fileInfo) GetAllXattr() map[string]string { return fi.stat.Xattrs }
