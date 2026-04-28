@@ -78,6 +78,7 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 	}
 	fsys := &Writer{
 		out:          out,
+		blockSize:    o.blockSize,
 		buildTime:    o.buildTime,
 		buildTimeNs:  o.buildTimeNs,
 		hasBuildTime: o.hasBuildTime,
@@ -127,6 +128,16 @@ func Merge() CopyOpt {
 }
 
 // --- CreateOpt functions ---
+
+// WithBlockSize sets the filesystem block size. The value must be a power
+// of two between 512 and 64 KiB. When unset the default is 4096.
+// If CopyFrom is called with a source that declares a different block size,
+// CopyFrom returns an error.
+func WithBlockSize(n int) CreateOpt {
+	return func(o *createOptions) {
+		o.blockSize = n
+	}
+}
 
 // WithBuildTime sets the filesystem build timestamp.
 func WithBuildTime(sec uint64, nsec uint32) CreateOpt {
@@ -522,6 +533,11 @@ func (fsys *Writer) Close() error {
 		defer func() { _ = fsys.spool.Close() }()
 	}
 
+	if fsys.blockSize != 0 {
+		if err := fsys.setBlockSize(fsys.blockSize); err != nil {
+			return err
+		}
+	}
 	fsys.resolveBlockSize()
 
 	if fsys.dataFile != nil {
@@ -715,6 +731,7 @@ type createOptions struct {
 	buildTime    uint64
 	buildTimeNs  uint32
 	hasBuildTime bool
+	blockSize    int      // 0 = use default
 	dataFile     *os.File // external data file for metadata-only mode
 	tempDir      string   // temp directory for spool file
 }

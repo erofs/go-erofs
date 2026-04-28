@@ -12,8 +12,10 @@ import (
 	"github.com/erofs/go-erofs/internal/disk"
 )
 
-// maxBlockSize is the largest block size we support.
-const maxBlockSize = 1 << 20
+// maxBlockSize is the largest block size we support. EROFS images with
+// larger block sizes are unmountable on common platforms (aarch64 caps
+// page size at 64 KiB) and the reader rejects BlkSizeBits > 16.
+const maxBlockSize = 1 << 16
 
 // onlyWriter wraps an io.Writer to hide io.ReaderFrom so that
 // io.CopyBuffer uses the caller-provided buffer instead of
