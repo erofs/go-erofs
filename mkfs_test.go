@@ -2,6 +2,7 @@ package erofs_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/fs"
@@ -466,6 +467,87 @@ func TestCreateFSEmpty(t *testing.T) {
 	if len(entries) != 0 {
 		t.Errorf("expected empty root dir, got %d entries", len(entries))
 	}
+}
+
+// TestCreateFSBlockSize verifies WithBlockSize produces valid images
+// with different block sizes and that invalid sizes are rejected.
+func TestCreateFSBlockSize(t *testing.T) {
+	for _, bs := range []int{512, 1024, 4096, 65536} {
+		t.Run(fmt.Sprintf("%d", bs), func(t *testing.T) {
+			var buf testBuffer
+			fsys := erofs.Create(&buf, erofs.WithBlockSize(bs))
+
+			f, err := fsys.Create("/file.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Write enough data to span multiple blocks at the smallest size.
+			data := bytes.Repeat([]byte("X"), bs+1)
+			if _, err := f.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := fsys.Mkdir("/dir", 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := fsys.Close(); err != nil {
+				t.Fatal("Close:", err)
+			}
+
+			// fsck.erofs mmaps the superblock and refuses block sizes
+			// larger than the host's page size, so skip it in that case.
+			// The library itself produces a valid image regardless; the
+			// remaining checks below verify it independently.
+			if bs <= os.Getpagesize() {
+				erofstest.FsckErofsBytes(t, buf.Bytes())
+			}
+
+			// Verify BlkSizeBits in the superblock.
+			var sb disk.SuperBlock
+			r := bytes.NewReader(buf.Bytes()[disk.SuperBlockOffset:])
+			if err := binary.Read(r, binary.LittleEndian, &sb); err != nil {
+				t.Fatal("decode superblock:", err)
+			}
+			if got := 1 << sb.BlkSizeBits; got != bs {
+				t.Errorf("superblock block size = %d, want %d", got, bs)
+			}
+
+			efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatal("Open:", err)
+			}
+
+			erofstest.CheckFileBytes(t, efs, "file.txt", data)
+		})
+	}
+
+	t.Run("invalid/not-power-of-two", func(t *testing.T) {
+		var buf testBuffer
+		fsys := erofs.Create(&buf, erofs.WithBlockSize(1000))
+		if err := fsys.Close(); err == nil {
+			t.Fatal("expected error for non-power-of-two block size")
+		}
+	})
+
+	t.Run("invalid/too-small", func(t *testing.T) {
+		var buf testBuffer
+		fsys := erofs.Create(&buf, erofs.WithBlockSize(256))
+		if err := fsys.Close(); err == nil {
+			t.Fatal("expected error for block size below minimum")
+		}
+	})
+
+	t.Run("invalid/too-large", func(t *testing.T) {
+		var buf testBuffer
+		fsys := erofs.Create(&buf, erofs.WithBlockSize(2<<20))
+		if err := fsys.Close(); err == nil {
+			t.Fatal("expected error for block size above maximum")
+		}
+	})
 }
 
 // TestCreateFSSetNlink verifies that SetNlink overrides computed nlink.
