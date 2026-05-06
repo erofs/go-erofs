@@ -27,6 +27,7 @@ type Writer struct {
 	buildTime    uint64 // from WithBuildTime or buildTimer
 	buildTimeNs  uint32
 	hasBuildTime bool
+	wErr         error               // sticky error: once set, all subsequent ops return it
 	root         *fsEntry            // root directory
 	byPath       map[string]*fsEntry // path → entry (all types)
 
@@ -78,7 +79,6 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 	}
 	fsys := &Writer{
 		out:          out,
-		blockSize:    o.blockSize,
 		buildTime:    o.buildTime,
 		buildTimeNs:  o.buildTimeNs,
 		hasBuildTime: o.hasBuildTime,
@@ -86,6 +86,12 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		byPath:       map[string]*fsEntry{"/": root},
 		dataFile:     o.dataFile,
 		tempDir:      o.tempDir,
+	}
+
+	if o.blockSize != 0 {
+		if err := fsys.setBlockSize(o.blockSize); err != nil {
+			fsys.wErr = err
+		}
 	}
 
 	if o.dataFile != nil {
@@ -131,6 +137,7 @@ func Merge() CopyOpt {
 
 // WithBlockSize sets the filesystem block size. The value must be a power
 // of two between 512 and 64 KiB. When unset the default is 4096.
+// An invalid size causes subsequent Writer operations to return an error.
 // If CopyFrom is called with a source that declares a different block size,
 // CopyFrom returns an error.
 func WithBlockSize(n int) CreateOpt {
@@ -170,6 +177,9 @@ func WithTempDir(dir string) CreateOpt {
 // Create creates a regular file with default mode 0644. The caller must
 // Close the returned File.
 func (fsys *Writer) Create(name string) (*File, error) {
+	if fsys.wErr != nil {
+		return nil, fsys.wErr
+	}
 	name = cleanPath(name)
 	if name == "/" {
 		return nil, fmt.Errorf("mkfs: cannot create file at root")
@@ -209,6 +219,9 @@ func (fsys *Writer) Create(name string) (*File, error) {
 // Mkdir creates a directory. Only permission bits from perm are used;
 // type bits are forced to directory. Mkdir("/", perm) sets root permissions.
 func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	name = cleanPath(name)
 	if name == "/" {
 		fsys.root.mode = disk.StatTypeDir | uint16(perm.Perm())
@@ -231,6 +244,9 @@ func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
 
 // Symlink creates newname as a symbolic link to oldname (mode 0777).
 func (fsys *Writer) Symlink(oldname, newname string) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	newname = cleanPath(newname)
 	if newname == "/" {
 		return fmt.Errorf("mkfs: cannot create symlink at root")
@@ -254,6 +270,9 @@ func (fsys *Writer) Symlink(oldname, newname string) error {
 // Mknod creates a device, FIFO, or socket. mode must include type bits
 // (e.g. disk.StatTypeChrdev | 0o666).
 func (fsys *Writer) Mknod(name string, mode uint16, rdev uint32) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	name = cleanPath(name)
 	if name == "/" {
 		return fmt.Errorf("mkfs: cannot mknod at root")
@@ -278,6 +297,9 @@ func (fsys *Writer) Mknod(name string, mode uint16, rdev uint32) error {
 
 // Chmod sets permission bits on the named path, preserving type bits.
 func (fsys *Writer) Chmod(name string, mode fs.FileMode) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	e, err := fsys.lookup(name)
 	if err != nil {
 		return err
@@ -289,6 +311,9 @@ func (fsys *Writer) Chmod(name string, mode fs.FileMode) error {
 
 // Chown sets the owner UID and GID on the named path.
 func (fsys *Writer) Chown(name string, uid, gid int) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	e, err := fsys.lookup(name)
 	if err != nil {
 		return err
@@ -301,6 +326,9 @@ func (fsys *Writer) Chown(name string, uid, gid int) error {
 // Chtimes sets the access and modification times on the named path.
 // EROFS only stores mtime; atime is retained for read-back before Close.
 func (fsys *Writer) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	e, err := fsys.lookup(name)
 	if err != nil {
 		return err
@@ -314,6 +342,9 @@ func (fsys *Writer) Chtimes(name string, atime time.Time, mtime time.Time) error
 
 // Setxattr sets an extended attribute on the named path.
 func (fsys *Writer) Setxattr(name, attr, value string) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	e, err := fsys.lookup(name)
 	if err != nil {
 		return err
@@ -327,6 +358,9 @@ func (fsys *Writer) Setxattr(name, attr, value string) error {
 
 // SetNlink overrides the computed link count on the named path.
 func (fsys *Writer) SetNlink(name string, nlink uint32) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	e, err := fsys.lookup(name)
 	if err != nil {
 		return err
@@ -343,6 +377,9 @@ func (fsys *Writer) SetNlink(name string, nlink uint32) error {
 // Reads symlink targets via readLinker interface when Entry.LinkTarget is empty.
 // If src implements blockSizer, the image block size is set accordingly.
 func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	// Reset per-CopyFrom state.
 	fsys.copyMetadataOnly = false
 	fsys.copyMerge = false
@@ -524,6 +561,9 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 
 // Close writes the EROFS image. The FS must not be used after Close.
 func (fsys *Writer) Close() error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
 	if fsys.closed {
 		return fmt.Errorf("mkfs: FS already closed")
 	}
@@ -533,11 +573,6 @@ func (fsys *Writer) Close() error {
 		defer func() { _ = fsys.spool.Close() }()
 	}
 
-	if fsys.blockSize != 0 {
-		if err := fsys.setBlockSize(fsys.blockSize); err != nil {
-			return err
-		}
-	}
 	fsys.resolveBlockSize()
 
 	if fsys.dataFile != nil {
