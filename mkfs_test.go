@@ -525,28 +525,98 @@ func TestCreateFSBlockSize(t *testing.T) {
 		})
 	}
 
-	t.Run("invalid/not-power-of-two", func(t *testing.T) {
-		var buf testBuffer
-		fsys := erofs.Create(&buf, erofs.WithBlockSize(1000))
-		if err := fsys.Close(); err == nil {
-			t.Fatal("expected error for non-power-of-two block size")
-		}
-	})
+	// Invalid sizes must surface from the first Writer operation, not be
+	// deferred until Close — otherwise a data file in WithDataFile mode
+	// could be partially written before the error fires.
+	for _, c := range []struct {
+		name string
+		size int
+	}{
+		{"not-power-of-two", 1000},
+		{"too-small", 256},
+		{"too-large", 1 << 17},
+	} {
+		t.Run("invalid/"+c.name, func(t *testing.T) {
+			var buf testBuffer
+			fsys := erofs.Create(&buf, erofs.WithBlockSize(c.size))
+			if _, err := fsys.Create("/file.txt"); err == nil {
+				t.Errorf("Create: expected error for invalid block size %d", c.size)
+			}
+			if err := fsys.Mkdir("/dir", 0o755); err == nil {
+				t.Errorf("Mkdir: expected error for invalid block size %d", c.size)
+			}
+			if err := fsys.Close(); err == nil {
+				t.Errorf("Close: expected error for invalid block size %d", c.size)
+			}
+		})
+	}
 
-	t.Run("invalid/too-small", func(t *testing.T) {
-		var buf testBuffer
-		fsys := erofs.Create(&buf, erofs.WithBlockSize(256))
-		if err := fsys.Close(); err == nil {
-			t.Fatal("expected error for block size below minimum")
+	// Data-file mode exercises the padding/chunk-index paths in
+	// File.closeDataFile, which use resolveBlockSize and so are sensitive
+	// to a non-default block size.
+	t.Run("dataFile/1024", func(t *testing.T) {
+		const bs = 1024
+		dataPath := filepath.Join(t.TempDir(), "data.bin")
+		df, err := os.Create(dataPath)
+		if err != nil {
+			t.Fatal(err)
 		}
-	})
+		defer func() { _ = df.Close() }()
 
-	t.Run("invalid/too-large", func(t *testing.T) {
-		var buf testBuffer
-		fsys := erofs.Create(&buf, erofs.WithBlockSize(2<<20))
-		if err := fsys.Close(); err == nil {
-			t.Fatal("expected error for block size above maximum")
+		var metaBuf testBuffer
+		fsys := erofs.Create(&metaBuf, erofs.WithBlockSize(bs), erofs.WithDataFile(df))
+
+		// Span multiple blocks so chunk indexes and padding both run.
+		data := bytes.Repeat([]byte("Y"), bs*3+17)
+		f, err := fsys.Create("/big.bin")
+		if err != nil {
+			t.Fatal(err)
 		}
+		if _, err := f.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Second file, smaller than a block, to verify padding around it.
+		small := []byte("hi\n")
+		f2, err := fsys.Create("/small.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f2.Write(small); err != nil {
+			t.Fatal(err)
+		}
+		if err := f2.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := fsys.Close(); err != nil {
+			t.Fatal("Close:", err)
+		}
+
+		// Data file must be padded to a block boundary.
+		fi, err := os.Stat(dataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size()%int64(bs) != 0 {
+			t.Errorf("data file size %d is not a multiple of block size %d", fi.Size(), bs)
+		}
+
+		dfRead, err := os.Open(dataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = dfRead.Close() }()
+
+		efs, err := erofs.Open(bytes.NewReader(metaBuf.Bytes()), erofs.WithExtraDevices(dfRead))
+		if err != nil {
+			t.Fatal("Open:", err)
+		}
+		erofstest.CheckFileBytes(t, efs, "big.bin", data)
+		erofstest.CheckFileBytes(t, efs, "small.txt", small)
 	})
 }
 
