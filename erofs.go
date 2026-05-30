@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/erofs/go-erofs/internal/disk"
+	"github.com/erofs/go-erofs/internal/zerofs"
 )
 
 // Errors
@@ -184,11 +185,30 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 		}
 	}
 
-	// Error out filesystems with unsupported compressed inodes
-	if i.sb.FeatureIncompat&disk.FeatureIncompatLZ4_0Padding != 0 ||
-		i.sb.ComprAlgs != 0 {
-		return nil, fmt.Errorf("unsupported compressed filesystem (FeatureIncompat=0x%x, ComprAlgs=0x%x): %w",
-			i.sb.FeatureIncompat, i.sb.ComprAlgs, ErrNotImplemented)
+	// LZ4 is the only supported compression algorithm. The LZ4_0PADDING
+	// incompat bit marks the standard EROFS layout where the LZ4 stream
+	// sits at the end of each physical block with leading zero padding;
+	// the in-tree decoder in internal/zerofs scans that margin.
+	//
+	// SuperBlock.ComprAlgs is a union: when COMPR_CFGS is set it is a
+	// bitmap of available algorithms; otherwise it is lz4_max_distance,
+	// and the image uses LZ4 implicitly (no other algorithm was supported
+	// in pre-COMPR_CFGS erofs).
+	i.lz4Cfg.MaxPclusterBlks = 1
+	if i.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs != 0 {
+		if i.sb.ComprAlgs&^disk.ComprAlgLZ4 != 0 {
+			return nil, fmt.Errorf("unsupported compression algorithm 0x%x (only LZ4 supported): %w",
+				i.sb.ComprAlgs, ErrNotImplemented)
+		}
+		if err := i.parseComprCfgs(); err != nil {
+			return nil, err
+		}
+	} else {
+		// Pre-COMPR_CFGS image: u1 is lz4_max_distance rather than a
+		// ComprAlgs bitmap. Recorded for reference; the in-tree LZ4
+		// decoder bounds match offsets against the current decompressed
+		// pcluster buffer regardless of this value.
+		i.lz4Cfg.MaxDistance = i.sb.ComprAlgs
 	}
 
 	i.blkPool.New = func() any {
@@ -234,6 +254,60 @@ type image struct {
 	longPrefixes []string // cached long xattr prefixes
 	prefixesOnce sync.Once
 	prefixesErr  error
+
+	// lz4Cfg holds parsed COMPR_CFGS / defaults for LZ4 decompression.
+	lz4Cfg disk.LZ4Cfgs
+
+	// pcCache caches recently decompressed pclusters across compressed reads.
+	pcCacheOnce sync.Once
+	pcCache     *pclusterCache
+}
+
+// maxLZ4PclusterBlks bounds MaxPclusterBlks parsed from COMPR_CFGS. The Linux
+// kernel enforces the same 1 MiB ceiling.
+const maxLZ4PclusterBlks = 256
+
+// parseComprCfgs walks the compression configuration records that follow the
+// superblock. Each record is [u16 size][size bytes payload]; one record per
+// bit set in sb.ComprAlgs in least-significant-bit-first order.
+func (img *image) parseComprCfgs() error {
+	pos := int64(disk.SuperBlockOffset + disk.SizeSuperBlock)
+	algs := img.sb.ComprAlgs
+	for bit := uint16(0); algs != 0; bit++ {
+		mask := uint16(1) << bit
+		if algs&mask == 0 {
+			continue
+		}
+		algs &^= mask
+		var sizeBuf [2]byte
+		if _, err := img.meta.ReadAt(sizeBuf[:], pos); err != nil {
+			return fmt.Errorf("read compr_cfgs size at %d: %w", pos, err)
+		}
+		size := int(binary.LittleEndian.Uint16(sizeBuf[:]))
+		pos += 2
+		payload := make([]byte, size)
+		if _, err := img.meta.ReadAt(payload, pos); err != nil {
+			return fmt.Errorf("read compr_cfgs payload at %d (size=%d): %w", pos, size, err)
+		}
+		pos += int64(size)
+		if mask == disk.ComprAlgLZ4 {
+			if size < disk.SizeLZ4Cfgs {
+				return fmt.Errorf("lz4 compr_cfgs payload too short: %d < %d: %w",
+					size, disk.SizeLZ4Cfgs, ErrInvalidSuperblock)
+			}
+			if _, err := binary.Decode(payload[:disk.SizeLZ4Cfgs], binary.LittleEndian, &img.lz4Cfg); err != nil {
+				return fmt.Errorf("decode lz4 compr_cfgs: %w", err)
+			}
+			if img.lz4Cfg.MaxPclusterBlks == 0 {
+				img.lz4Cfg.MaxPclusterBlks = 1
+			}
+			if img.lz4Cfg.MaxPclusterBlks > maxLZ4PclusterBlks {
+				return fmt.Errorf("max_pclusterblks %d exceeds limit %d: %w",
+					img.lz4Cfg.MaxPclusterBlks, maxLZ4PclusterBlks, ErrInvalid)
+			}
+		}
+	}
+	return nil
 }
 
 // start physical offset of the separate metadata zone
@@ -658,7 +732,7 @@ func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 		b.end = int32(blockEnd)
 		return b, nil
 	case disk.LayoutCompressedFull, disk.LayoutCompressedCompact:
-		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrNotImplemented)
+		return img.loadCompressedBlock(fi, pos)
 	default:
 		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrInvalid)
 	}
@@ -677,6 +751,230 @@ func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 		return nil, fmt.Errorf("failed to read full block for nid %d: %w, expected %d, actual %d", fi.nid, ErrInvalid, blockEnd-blockOffset, n)
 	}
 	return b, nil
+}
+
+// loadCompressedBlock returns the logical block containing file offset pos
+// for a compressed inode. It locates the containing pcluster via the inode's
+// zerofs.Decoder, fetches the decompressed pcluster bytes (LRU-cached), and
+// returns the block-slice between pos (rounded down to the block start) and
+// either the block end or the pcluster end, whichever comes first.
+//
+// The returned block's [offset, end) slice covers the bytes from pos to
+// whichever of (block end, pcluster end, file end) comes first. Reading a
+// block that straddles a pcluster boundary requires two calls (the caller
+// resumes at the pcluster boundary).
+func (img *image) loadCompressedBlock(fi *inode, pos int64) (*block, error) {
+	dec, err := img.zDecoder(fi)
+	if err != nil {
+		return nil, err
+	}
+	if pos < 0 || pos >= fi.size {
+		return nil, fmt.Errorf("compressed read out of range: pos=%d size=%d: %w", pos, fi.size, io.EOF)
+	}
+
+	pc, err := dec.FindPclusterForOffset(pos)
+	if err != nil {
+		return nil, fmt.Errorf("nid %d: %w", fi.nid, err)
+	}
+
+	pcBytes, err := img.getOrDecompressPcluster(fi.nid, dec, pc)
+	if err != nil {
+		return nil, fmt.Errorf("nid %d: %w", fi.nid, err)
+	}
+
+	blkSize := int64(1 << img.sb.BlkSizeBits)
+	blockStart := pos &^ (blkSize - 1)
+	blockEnd := blockStart + blkSize
+
+	// Clip the slice to the pcluster and to the file end.
+	sliceEnd := blockEnd
+	if sliceEnd > pc.LogStart+pc.LogLen {
+		sliceEnd = pc.LogStart + pc.LogLen
+	}
+	if sliceEnd > fi.size {
+		sliceEnd = fi.size
+	}
+	if pos >= sliceEnd {
+		// Should not happen: FindPclusterForOffset returned a pcluster that
+		// does not actually contain pos.
+		return nil, fmt.Errorf("nid %d: pos %d not in pcluster [%d,%d): %w",
+			fi.nid, pos, pc.LogStart, pc.LogStart+pc.LogLen, ErrInvalid)
+	}
+
+	startInPC := pos - pc.LogStart
+	endInPC := sliceEnd - pc.LogStart
+
+	b := img.getBlock()
+	posInBlock := int(pos - blockStart)
+	n := copy(b.buf[posInBlock:int(blkSize)], pcBytes[startInPC:endInPC])
+	b.offset = int32(posInBlock)
+	b.end = int32(posInBlock + n)
+	return b, nil
+}
+
+// zDecoder returns the inode's compressed-data decoder, building it on first
+// use. Errors during initialisation are cached so we don't retry the same
+// invalid header repeatedly.
+func (img *image) zDecoder(fi *inode) (*zerofs.Decoder, error) {
+	if fi.zdec != nil {
+		return fi.zdec, nil
+	}
+	if fi.zdecErr != nil {
+		return nil, fi.zdecErr
+	}
+	dec, err := img.buildZDecoder(fi)
+	if err != nil {
+		fi.zdecErr = err
+		return nil, err
+	}
+	fi.zdec = dec
+	return dec, nil
+}
+
+func (img *image) buildZDecoder(fi *inode) (*zerofs.Decoder, error) {
+	inodeAddr := img.metaStartPos() + int64(fi.nid)*disk.SizeInodeCompact
+	mapHeaderAddr := alignUp8(inodeAddr + int64(fi.icsize) + int64(fi.xsize))
+
+	var hbuf [disk.SizeZMapHeader]byte
+	if err := img.readMapHeader(fi, mapHeaderAddr, hbuf[:]); err != nil {
+		return nil, err
+	}
+	header, err := zerofs.ParseHeader(hbuf[:])
+	if err != nil {
+		return nil, err
+	}
+
+	lclusterBits := img.sb.BlkSizeBits + (header.ClusterBits & 7)
+	if lclusterBits < img.sb.BlkSizeBits {
+		return nil, fmt.Errorf("nid %d: invalid lclusterbits %d (blkSizeBits=%d)",
+			fi.nid, lclusterBits, img.sb.BlkSizeBits)
+	}
+	lcsize := int64(1) << lclusterBits
+	nlc := int((fi.size + lcsize - 1) / lcsize)
+
+	if fi.inodeLayout != disk.LayoutCompressedFull {
+		return nil, fmt.Errorf("nid %d: compact lcluster layout not yet supported: %w",
+			fi.nid, ErrNotImplemented)
+	}
+
+	// The lcluster index follows the 8-byte map header. mkfs.erofs's legacy
+	// (pre-COMPR_CFGS) full layout inserts an additional 8 bytes of padding
+	// between the header and the index; modern images do not. We detect
+	// legacy mode by the absence of FeatureIncompatComprCfgs.
+	indexBase := mapHeaderAddr + disk.SizeZMapHeader
+	if img.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs == 0 {
+		indexBase += 8 // Z_EROFS_LEGACY_HEADER_PADDING
+	}
+
+	return &zerofs.Decoder{
+		Meta:         img.meta,
+		IndexBase:    indexBase,
+		Layout:       fi.inodeLayout,
+		BlkSizeBits:  img.sb.BlkSizeBits,
+		LclusterBits: lclusterBits,
+		Header:       header,
+		Size:         fi.size,
+		NLclusters:   nlc,
+	}, nil
+}
+
+// readMapHeader fills dst with the 8 bytes at addr. It prefers the cached
+// inode block when the header sits within it; otherwise it reads through the
+// meta ReaderAt.
+func (img *image) readMapHeader(fi *inode, addr int64, dst []byte) error {
+	if fi.cached != nil {
+		blkSize := int64(1 << img.sb.BlkSizeBits)
+		blockStart := (img.metaStartPos() + int64(fi.nid)*disk.SizeInodeCompact) &^ (blkSize - 1)
+		off := addr - blockStart
+		if off >= 0 && off+int64(len(dst)) <= int64(len(fi.cached.buf)) &&
+			off+int64(len(dst)) <= int64(fi.cached.end) {
+			copy(dst, fi.cached.buf[off:off+int64(len(dst))])
+			return nil
+		}
+	}
+	if _, err := img.meta.ReadAt(dst, addr); err != nil {
+		return fmt.Errorf("read map header at %d: %w", addr, err)
+	}
+	return nil
+}
+
+func alignUp8(v int64) int64 { return (v + 7) &^ 7 }
+
+// pclusterCacheSize bounds the LRU. With MaxPclusterBlks=1 (default), each
+// entry holds at most one block's decompressed bytes (~lclusterSize each);
+// total worst case ~cap * MaxPclusterBlks * blockSize.
+const pclusterCacheSize = 8
+
+type pclusterKey struct {
+	nid     uint64
+	headBlk uint32
+}
+
+type pclusterCacheEntry struct {
+	key  pclusterKey
+	data []byte
+}
+
+type pclusterCache struct {
+	mu    sync.Mutex
+	cap   int
+	items map[pclusterKey]int // key -> index in order
+	order []*pclusterCacheEntry
+}
+
+func newPclusterCache(cap int) *pclusterCache {
+	return &pclusterCache{cap: cap, items: make(map[pclusterKey]int, cap)}
+}
+
+func (c *pclusterCache) get(k pclusterKey) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx, ok := c.items[k]
+	if !ok {
+		return nil, false
+	}
+	e := c.order[idx]
+	// Move to MRU (end of slice).
+	if idx != len(c.order)-1 {
+		copy(c.order[idx:], c.order[idx+1:])
+		c.order[len(c.order)-1] = e
+		for i := idx; i < len(c.order); i++ {
+			c.items[c.order[i].key] = i
+		}
+	}
+	return e.data, true
+}
+
+func (c *pclusterCache) put(k pclusterKey, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.items[k]; ok {
+		return
+	}
+	if len(c.order) >= c.cap {
+		evict := c.order[0]
+		c.order = c.order[1:]
+		delete(c.items, evict.key)
+		for i, e := range c.order {
+			c.items[e.key] = i
+		}
+	}
+	c.order = append(c.order, &pclusterCacheEntry{key: k, data: data})
+	c.items[k] = len(c.order) - 1
+}
+
+func (img *image) getOrDecompressPcluster(nid uint64, dec *zerofs.Decoder, pc zerofs.Pcluster) ([]byte, error) {
+	img.pcCacheOnce.Do(func() { img.pcCache = newPclusterCache(pclusterCacheSize) })
+	key := pclusterKey{nid: nid, headBlk: pc.HeadBlk}
+	if data, ok := img.pcCache.get(key); ok {
+		return data, nil
+	}
+	buf := make([]byte, pc.LogLen)
+	if _, err := zerofs.Decompress(img.meta, img.sb.BlkSizeBits, pc, buf); err != nil {
+		return nil, err
+	}
+	img.pcCache.put(key, buf)
+	return buf, nil
 }
 
 func (img *image) getBlock() *block {
@@ -1441,6 +1739,11 @@ type inode struct {
 	mtime       uint64
 	mtimeNs     uint32
 	cached      *block
+
+	// zdec is the lazily-initialised compressed-data decoder. Only set for
+	// inodes whose inodeLayout is LayoutCompressedFull or LayoutCompressedCompact.
+	zdec    *zerofs.Decoder
+	zdecErr error
 }
 
 func (ino *inode) flatDataOffset() int64 {

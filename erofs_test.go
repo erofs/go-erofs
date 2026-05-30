@@ -1,6 +1,7 @@
 package erofs_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -61,14 +62,16 @@ func TestErofs(t *testing.T) {
 		erofstest.SparseFiles.Run(t, erofstest.MkfsErofsMaxSize(1024*1024, chunkFlag))
 	})
 
-	// Compression format is unimplemented — verify EroFS returns ErrNotImplemented.
-	t.Run("lz4-unimplemented", func(t *testing.T) {
+	// LZ4-compressed image with the legacy (full) lcluster layout: open
+	// and read a small file end-to-end.
+	t.Run("lz4-full-layout", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("mkfs.erofs compression is not included on Windows")
 		}
 		tc := erofstest.TarContext{}
+		content := []byte("content\n")
 		wt := erofstest.TarAll(
-			tc.File("/file.txt", []byte("content\n"), 0644),
+			tc.File("/file.txt", content, 0644),
 		)
 		tarStream := erofstest.TarFromWriterTo(wt)
 		defer func() {
@@ -78,7 +81,10 @@ func TestErofs(t *testing.T) {
 		}()
 
 		path := filepath.Join(t.TempDir(), "compressed.erofs")
-		if err := erofstest.ConvertTarErofs(context.Background(), tarStream, path, "", []string{"-zlz4"}); err != nil {
+		// -Elegacy-compress forces the full lcluster layout; the compact
+		// alternative is not decoded by this library.
+		if err := erofstest.ConvertTarErofs(context.Background(), tarStream, path, "",
+			[]string{"-zlz4", "-Elegacy-compress"}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -92,9 +98,16 @@ func TestErofs(t *testing.T) {
 			}
 		}()
 
-		_, err = erofs.Open(f)
-		if !errors.Is(err, erofs.ErrNotImplemented) {
-			t.Fatalf("expected ErrNotImplemented, got %v", err)
+		fsys, err := erofs.Open(f)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		got, err := fs.ReadFile(fsys, "file.txt")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("file.txt content: got %q want %q", got, content)
 		}
 	})
 }
