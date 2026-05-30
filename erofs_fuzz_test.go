@@ -56,6 +56,7 @@ func initFuzzFlat(t testing.TB) fuzzImage {
 
 		fuzzFlat = buildFuzzImage(t, entries, files, []string{"."})
 	})
+	skipIfFuzzImageUnavailable(t, fuzzFlat)
 	return fuzzFlat
 }
 
@@ -84,6 +85,7 @@ func initFuzzNested(t testing.TB) fuzzImage {
 
 		fuzzNested = buildFuzzImage(t, entries, files, append([]string{"."}, dirs...))
 	})
+	skipIfFuzzImageUnavailable(t, fuzzNested)
 	return fuzzNested
 }
 
@@ -120,6 +122,7 @@ func initFuzzDeep(t testing.TB) fuzzImage {
 
 		fuzzDeep = buildFuzzImage(t, entries, files, append([]string{"."}, dirs...))
 	})
+	skipIfFuzzImageUnavailable(t, fuzzDeep)
 	return fuzzDeep
 }
 
@@ -143,7 +146,21 @@ func initFuzzWide(t testing.TB) fuzzImage {
 
 		fuzzWide = buildFuzzImage(t, entries, files, append([]string{"."}, dirs...))
 	})
+	skipIfFuzzImageUnavailable(t, fuzzWide)
 	return fuzzWide
+}
+
+// skipIfFuzzImageUnavailable handles the edge case where a previous fuzz
+// target already triggered the shared sync.Once and was skipped (e.g.
+// mkfs.erofs is missing). Once.Do marks itself done even when its function
+// calls t.Skipf via runtime.Goexit, leaving the shared fuzzImage zero. A
+// later target's seeds would then dereference a nil fs.FS and panic, so any
+// remaining caller skips here instead.
+func skipIfFuzzImageUnavailable(t testing.TB, img fuzzImage) {
+	t.Helper()
+	if img.fsys == nil {
+		t.Skipf("fuzz image unavailable (mkfs.erofs missing or earlier init skipped)")
+	}
 }
 
 func buildFuzzImage(t testing.TB, entries []erofstest.WriterToTar, files, dirs []string) fuzzImage {
