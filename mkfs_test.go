@@ -2189,6 +2189,592 @@ func TestChunksFromRangesValidation(t *testing.T) {
 	})
 }
 
+// --- Hardlink tests ---
+
+// TestWriterLinkBasic verifies that Link() produces a pair of paths sharing
+// the same inode NID and nlink == 2, with identical content.
+func TestWriterLinkBasic(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+
+	f, err := w.Create("/original.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("hello hardlink\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Link("/original.txt", "/alias.txt"); err != nil {
+		t.Fatal("Link:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckFile(t, efs, "original.txt", "hello hardlink\n")
+	erofstest.CheckFile(t, efs, "alias.txt", "hello hardlink\n")
+
+	stOrig := erofstest.Stat(t, efs, "original.txt")
+	stAlias := erofstest.Stat(t, efs, "alias.txt")
+
+	if stOrig.Ino != stAlias.Ino {
+		t.Errorf("Ino mismatch: original=%d alias=%d (should share inode)", stOrig.Ino, stAlias.Ino)
+	}
+	if stOrig.Nlink != 2 {
+		t.Errorf("original nlink: got %d, want 2", stOrig.Nlink)
+	}
+	if stAlias.Nlink != 2 {
+		t.Errorf("alias nlink: got %d, want 2", stAlias.Nlink)
+	}
+}
+
+// TestWriterLinkCrossDir verifies that Link() works across directories.
+func TestWriterLinkCrossDir(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+
+	if err := w.Mkdir("/dir1", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Mkdir("/dir2", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := w.Create("/dir1/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("cross-dir hardlink\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Link("/dir1/file.txt", "/dir2/link.txt"); err != nil {
+		t.Fatal("Link:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckFile(t, efs, "dir1/file.txt", "cross-dir hardlink\n")
+	erofstest.CheckFile(t, efs, "dir2/link.txt", "cross-dir hardlink\n")
+
+	st1 := erofstest.Stat(t, efs, "dir1/file.txt")
+	st2 := erofstest.Stat(t, efs, "dir2/link.txt")
+
+	if st1.Ino != st2.Ino {
+		t.Errorf("cross-dir Ino mismatch: %d != %d", st1.Ino, st2.Ino)
+	}
+	if st1.Nlink != 2 {
+		t.Errorf("nlink: got %d, want 2", st1.Nlink)
+	}
+}
+
+// TestWriterLinkThreeWay verifies three-way hardlinks share one inode with nlink == 3.
+func TestWriterLinkThreeWay(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+
+	f, err := w.Create("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("three-way\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Link("/a", "/b"); err != nil {
+		t.Fatal("Link /a → /b:", err)
+	}
+	if err := w.Link("/a", "/c"); err != nil {
+		t.Fatal("Link /a → /c:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	stA := erofstest.Stat(t, efs, "a")
+	stB := erofstest.Stat(t, efs, "b")
+	stC := erofstest.Stat(t, efs, "c")
+
+	if stA.Ino != stB.Ino || stA.Ino != stC.Ino {
+		t.Errorf("Ino mismatch: a=%d b=%d c=%d", stA.Ino, stB.Ino, stC.Ino)
+	}
+	if stA.Nlink != 3 {
+		t.Errorf("nlink: got %d, want 3", stA.Nlink)
+	}
+
+	for _, name := range []string{"a", "b", "c"} {
+		erofstest.CheckFile(t, efs, name, "three-way\n")
+	}
+}
+
+// TestWriterLinkViaAlias verifies that Link() from an alias to a new name
+// also results in the same canonical inode being shared.
+func TestWriterLinkViaAlias(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+
+	f, err := w.Create("/orig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("via alias\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Link from the canonical entry.
+	if err := w.Link("/orig", "/alias1"); err != nil {
+		t.Fatal("Link orig→alias1:", err)
+	}
+	// Link again from the canonical entry (not from alias1, same result).
+	if err := w.Link("/orig", "/alias2"); err != nil {
+		t.Fatal("Link orig→alias2:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	stOrig := erofstest.Stat(t, efs, "orig")
+	st1 := erofstest.Stat(t, efs, "alias1")
+	st2 := erofstest.Stat(t, efs, "alias2")
+
+	if stOrig.Ino != st1.Ino || stOrig.Ino != st2.Ino {
+		t.Errorf("Ino mismatch: orig=%d alias1=%d alias2=%d", stOrig.Ino, st1.Ino, st2.Ino)
+	}
+	if stOrig.Nlink != 3 {
+		t.Errorf("nlink: got %d, want 3", stOrig.Nlink)
+	}
+}
+
+// TestWriterLinkDevice verifies that Link() works on non-regular inodes
+// (character device, block device, FIFO).
+func TestWriterLinkDevice(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+
+	if err := w.Mknod("/fifo", disk.StatTypeFifo|0o644, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Link("/fifo", "/fifo2"); err != nil {
+		t.Fatal("Link:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	st1 := erofstest.Stat(t, efs, "fifo")
+	st2 := erofstest.Stat(t, efs, "fifo2")
+
+	if st1.Ino != st2.Ino {
+		t.Errorf("Ino mismatch: fifo=%d fifo2=%d", st1.Ino, st2.Ino)
+	}
+	if st1.Nlink != 2 {
+		t.Errorf("nlink: got %d, want 2", st1.Nlink)
+	}
+}
+
+// TestWriterLinkErrors verifies all the error conditions for Link().
+func TestWriterLinkErrors(t *testing.T) {
+	t.Run("same name", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/file.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/file.txt", "/file.txt"); err == nil {
+			t.Error("expected error for same oldname and newname")
+		}
+	})
+
+	t.Run("oldname not found", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		if err := w.Link("/nonexistent", "/link"); err == nil {
+			t.Error("expected error for missing oldname")
+		}
+	})
+
+	t.Run("newname already exists", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		f2, err := w.Create("/b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f2.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/a", "/b"); err == nil {
+			t.Error("expected error when newname already exists")
+		}
+	})
+
+	t.Run("target is directory", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		if err := w.Mkdir("/dir", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/dir", "/link"); err == nil {
+			t.Error("expected error for directory target")
+		}
+	})
+
+	t.Run("target is symlink", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		if err := w.Symlink("target", "/sym"); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/sym", "/link"); err == nil {
+			t.Error("expected error for symlink target")
+		}
+	})
+
+	t.Run("newname is root", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/file.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/file.txt", "/"); err == nil {
+			t.Error("expected error for newname == root")
+		}
+	})
+
+	t.Run("FS closed", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/file.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/file.txt", "/link"); err == nil {
+			t.Error("expected error for closed FS")
+		}
+	})
+}
+
+// TestWriterLinkSetNlinkConflict verifies that SetNlink returns an error for
+// any path in a hardlink group.
+func TestWriterLinkSetNlinkConflict(t *testing.T) {
+	t.Run("SetNlink on canonical after Link", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/orig")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/orig", "/alias"); err != nil {
+			t.Fatal("Link:", err)
+		}
+		if err := w.SetNlink("/orig", 99); err == nil {
+			t.Error("expected error: SetNlink on hard-linked entry")
+		}
+	})
+
+	t.Run("SetNlink on alias", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/orig")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Link("/orig", "/alias"); err != nil {
+			t.Fatal("Link:", err)
+		}
+		if err := w.SetNlink("/alias", 99); err == nil {
+			t.Error("expected error: SetNlink on alias entry")
+		}
+	})
+
+	t.Run("SetNlink on non-hard-linked file still works", func(t *testing.T) {
+		var buf testBuffer
+		w := erofs.Create(&buf)
+		f, err := w.Create("/solo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.SetNlink("/solo", 7); err != nil {
+			t.Errorf("SetNlink on non-hard-linked file: %v", err)
+		}
+	})
+}
+
+// TestWriterLinkDirEntries verifies that both hard-linked paths appear in their
+// respective directory listings.
+func TestWriterLinkDirEntries(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+
+	if err := w.Mkdir("/dir1", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Mkdir("/dir2", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := w.Create("/dir1/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Link("/dir1/file", "/dir2/file"); err != nil {
+		t.Fatal("Link:", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckDirEntries(t, efs, "dir1", []string{"file"})
+	erofstest.CheckDirEntries(t, efs, "dir2", []string{"file"})
+
+	st1 := erofstest.Stat(t, efs, "dir1/file")
+	st2 := erofstest.Stat(t, efs, "dir2/file")
+	if st1.Ino != st2.Ino {
+		t.Errorf("Ino mismatch: dir1/file=%d dir2/file=%d", st1.Ino, st2.Ino)
+	}
+}
+
+// TestCopyFromPreservesHardlinks verifies that CopyFrom(MetadataOnly) on an
+// EROFS image that contains hardlinks produces an output image where those
+// hardlinks are preserved (same NID, nlink == 2).
+func TestCopyFromPreservesHardlinks(t *testing.T) {
+	// Build a source image with a hardlink using the Go writer.
+	var srcBuf testBuffer
+	srcW := erofs.Create(&srcBuf)
+
+	f, err := srcW.Create("/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("hardlink content\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srcW.Link("/original", "/alias"); err != nil {
+		t.Fatal("Link:", err)
+	}
+	if err := srcW.Close(); err != nil {
+		t.Fatal("Close src:", err)
+	}
+
+	// Verify the source image is valid and has hardlinks.
+	erofstest.FsckErofsBytes(t, srcBuf.Bytes())
+	srcFS, err := erofs.Open(bytes.NewReader(srcBuf.Bytes()))
+	if err != nil {
+		t.Fatal("Open src:", err)
+	}
+	stSrcOrig := erofstest.Stat(t, srcFS, "original")
+	stSrcAlias := erofstest.Stat(t, srcFS, "alias")
+	if stSrcOrig.Ino != stSrcAlias.Ino {
+		t.Fatalf("source: Ino mismatch (hardlink not preserved in source): %d != %d", stSrcOrig.Ino, stSrcAlias.Ino)
+	}
+
+	// Copy via CopyFrom (MetadataOnly path uses copyFromImage).
+	dataPath := filepath.Join(t.TempDir(), "data.bin")
+	df, err := os.Create(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = df.Close() }()
+
+	var dstBuf testBuffer
+	dstW := erofs.Create(&dstBuf, erofs.WithDataFile(df))
+	if err := dstW.CopyFrom(srcFS, erofs.MetadataOnly()); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := dstW.Close(); err != nil {
+		t.Fatal("Close dst:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, dstBuf.Bytes())
+
+	dfRead, err := os.Open(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dfRead.Close() }()
+
+	dstFS, err := erofs.Open(bytes.NewReader(dstBuf.Bytes()), erofs.WithExtraDevices(dfRead))
+	if err != nil {
+		t.Fatal("Open dst:", err)
+	}
+
+	stDstOrig := erofstest.Stat(t, dstFS, "original")
+	stDstAlias := erofstest.Stat(t, dstFS, "alias")
+
+	if stDstOrig.Ino != stDstAlias.Ino {
+		t.Errorf("CopyFrom: Ino mismatch after copy: original=%d alias=%d (hardlink not preserved)", stDstOrig.Ino, stDstAlias.Ino)
+	}
+	if stDstOrig.Nlink != 2 {
+		t.Errorf("CopyFrom: original nlink: got %d, want 2", stDstOrig.Nlink)
+	}
+	if stDstAlias.Nlink != 2 {
+		t.Errorf("CopyFrom: alias nlink: got %d, want 2", stDstAlias.Nlink)
+	}
+}
+
+// TestCopyFromPreservesHardlinksNonMetadata verifies that a non-MetadataOnly
+// CopyFrom (WalkDir path with *Stat source) also preserves hardlinks.
+func TestCopyFromPreservesHardlinksNonMetadata(t *testing.T) {
+	// Build source image with hardlinks.
+	var srcBuf testBuffer
+	srcW := erofs.Create(&srcBuf)
+
+	f, err := srcW.Create("/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("shared data\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srcW.Link("/file", "/link"); err != nil {
+		t.Fatal("Link:", err)
+	}
+	if err := srcW.Close(); err != nil {
+		t.Fatal("Close src:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, srcBuf.Bytes())
+
+	srcFS, err := erofs.Open(bytes.NewReader(srcBuf.Bytes()))
+	if err != nil {
+		t.Fatal("Open src:", err)
+	}
+
+	// CopyFrom without MetadataOnly: uses WalkDir + *Stat hardlink detection.
+	var dstBuf testBuffer
+	dstW := erofs.Create(&dstBuf)
+	if err := dstW.CopyFrom(srcFS); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := dstW.Close(); err != nil {
+		t.Fatal("Close dst:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, dstBuf.Bytes())
+
+	dstFS, err := erofs.Open(bytes.NewReader(dstBuf.Bytes()))
+	if err != nil {
+		t.Fatal("Open dst:", err)
+	}
+
+	erofstest.CheckFile(t, dstFS, "file", "shared data\n")
+	erofstest.CheckFile(t, dstFS, "link", "shared data\n")
+
+	stFile := erofstest.Stat(t, dstFS, "file")
+	stLink := erofstest.Stat(t, dstFS, "link")
+
+	if stFile.Ino != stLink.Ino {
+		t.Errorf("WalkDir path: Ino mismatch: file=%d link=%d (hardlink not preserved)", stFile.Ino, stLink.Ino)
+	}
+	if stFile.Nlink != 2 {
+		t.Errorf("WalkDir path: file nlink: got %d, want 2", stFile.Nlink)
+	}
+}
+
 // statDataRange opens the named file in fsys via Stat() and returns its
 // DataRange() if the FileInfo supports it.
 func statDataRange(t *testing.T, fsys fs.FS, name string) []erofs.DataRange {

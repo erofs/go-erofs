@@ -536,9 +536,13 @@ func (w *erofsWriter) writeDirents(buf io.Writer, e *erofsEntry) (int, error) {
 	allEnts = append(allEnts, direntInfo{".", e.nid, disk.FileTypeDir})
 	allEnts = append(allEnts, direntInfo{"..", e.parentNid, disk.FileTypeDir})
 	for _, c := range e.children {
+		nid := c.nid
+		if c.linkTo != nil {
+			nid = c.linkTo.nid // hardlink alias: point at the canonical inode
+		}
 		allEnts = append(allEnts, direntInfo{
 			name:     c.name,
-			nid:      c.nid,
+			nid:      nid,
 			fileType: c.erofsFileType,
 		})
 	}
