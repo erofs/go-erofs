@@ -949,6 +949,17 @@ func (f *File) Chown(uid, gid int) error {
 	return nil
 }
 
+// Chtimes sets access and modification times on the open file. EROFS only
+// stores mtime on disk; atime is retained on the in-memory entry for
+// read-back before [Writer.Close].
+func (f *File) Chtimes(atime, mtime time.Time) error {
+	f.entry.atime = uint64(atime.Unix())
+	f.entry.atimeNs = uint32(atime.Nanosecond())
+	f.entry.mtime = uint64(mtime.Unix())
+	f.entry.mtimeNs = uint32(mtime.Nanosecond())
+	return nil
+}
+
 // --- Internal types ---
 
 // fsEntry is the in-memory representation of a filesystem entry held by Writer.
