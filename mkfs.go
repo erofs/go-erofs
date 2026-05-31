@@ -1,6 +1,7 @@
 package erofs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,6 +15,10 @@ import (
 	"github.com/erofs/go-erofs/internal/builder"
 	"github.com/erofs/go-erofs/internal/disk"
 )
+
+// errDirNotEmpty is returned by Remove when the named path is a non-empty
+// directory. Mirrors the behavior of os.Remove (which returns ENOTEMPTY).
+var errDirNotEmpty = errors.New("directory not empty")
 
 // --- Exported types ---
 
@@ -450,6 +455,104 @@ func (fsys *Writer) SetNlink(name string, nlink uint32) error {
 	e.nlink = nlink
 	e.nlinkSet = true
 	return nil
+}
+
+// Remove removes the named path from the writer's tree. It mirrors the
+// semantics of [os.Root.Remove]: it is non-recursive, returns
+// [fs.ErrNotExist] (wrapped in [fs.PathError]) if the path does not exist,
+// and returns an error if the path is a non-empty directory.
+//
+// Removing a hardlink alias only removes the dirent at that path; the
+// underlying inode and other aliases are preserved. Removing the canonical
+// path of a hardlink group with surviving aliases promotes the first
+// remaining alias to canonical (POSIX unlink semantics).
+//
+// Remove cannot be used to delete the root.
+//
+// Recursive removal can be implemented by the caller by listing the
+// directory with [fs.ReadDir] (via [Writer.Open]) and calling Remove on
+// each descendant before removing the directory itself.
+func (fsys *Writer) Remove(name string) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	if fsys.closed {
+		return fmt.Errorf("mkfs: FS is closed")
+	}
+	name = cleanPath(name)
+	if name == "/" {
+		return &fs.PathError{Op: "remove", Path: name, Err: fmt.Errorf("cannot remove root")}
+	}
+	e, ok := fsys.byPath[name]
+	if !ok {
+		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
+	}
+	// Non-empty directory check.
+	if e.mode&disk.StatTypeMask == disk.StatTypeDir {
+		for _, c := range e.children {
+			if !c.removed {
+				return &fs.PathError{Op: "remove", Path: name, Err: errDirNotEmpty}
+			}
+		}
+	}
+	fsys.unlinkOne(e)
+	return nil
+}
+
+// unlinkOne removes a single entry from the writer's tree, applying POSIX
+// unlink semantics for hardlinks. The entry must already be located in
+// byPath. Callers are responsible for any caller-visible preconditions
+// (e.g. empty-directory check).
+func (fsys *Writer) unlinkOne(e *fsEntry) {
+	switch {
+	case e.linkedTo != nil:
+		// Alias: drop the alias path from the canonical's hardlinks list.
+		canonical := e.linkedTo
+		for i, p := range canonical.hardlinks {
+			if p == e.path {
+				canonical.hardlinks = append(canonical.hardlinks[:i], canonical.hardlinks[i+1:]...)
+				break
+			}
+		}
+	case len(e.hardlinks) > 0:
+		// Canonical with surviving aliases: promote first alias.
+		newCanonicalPath := e.hardlinks[0]
+		remaining := e.hardlinks[1:]
+		newCanonical := fsys.byPath[newCanonicalPath]
+		if newCanonical != nil {
+			// Copy data-bearing fields from old canonical to the alias entry.
+			newCanonical.mode = e.mode
+			newCanonical.uid = e.uid
+			newCanonical.gid = e.gid
+			newCanonical.atime = e.atime
+			newCanonical.atimeNs = e.atimeNs
+			newCanonical.mtime = e.mtime
+			newCanonical.mtimeNs = e.mtimeNs
+			newCanonical.size = e.size
+			newCanonical.rdev = e.rdev
+			newCanonical.xattrs = e.xattrs
+			newCanonical.linkTarget = e.linkTarget
+			newCanonical.chunks = e.chunks
+			newCanonical.contiguous = e.contiguous
+			newCanonical.spoolOff = e.spoolOff
+			newCanonical.dataStartOff = e.dataStartOff
+			newCanonical.fileClosed = e.fileClosed
+			newCanonical.directData = e.directData
+			newCanonical.metadataOnly = e.metadataOnly
+			newCanonical.nlink = e.nlink
+			newCanonical.nlinkSet = e.nlinkSet
+			newCanonical.linkedTo = nil
+			newCanonical.hardlinks = remaining
+			// Repoint remaining aliases at the new canonical.
+			for _, ap := range remaining {
+				if a := fsys.byPath[ap]; a != nil {
+					a.linkedTo = newCanonical
+				}
+			}
+		}
+	}
+	e.removed = true
+	delete(fsys.byPath, e.path)
 }
 
 // --- Writer bulk copy ---
