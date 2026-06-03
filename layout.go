@@ -100,8 +100,9 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 
 		// Recalculate trailing size now that layout is decided
 		e.trailingSize = w.calcTrailingSize(e)
+		e.chunkPad = chunkIndexPad(e)
 
-		totalInodeSize := headerSize + e.trailingSize
+		totalInodeSize := headerSize + e.chunkPad + e.trailingSize
 		// Pad to 32-byte boundary
 		if totalInodeSize%32 != 0 {
 			totalInodeSize = (totalInodeSize + 31) & ^31
@@ -122,7 +123,8 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 				// Fall back to flat-plain (data would cross block boundary)
 				e.layout = disk.LayoutFlatPlain
 				e.trailingSize = w.calcTrailingSize(e)
-				totalInodeSize = headerSize + e.trailingSize
+				e.chunkPad = chunkIndexPad(e)
+				totalInodeSize = headerSize + e.chunkPad + e.trailingSize
 				if totalInodeSize%32 != 0 {
 					totalInodeSize = (totalInodeSize + 31) & ^31
 				}
@@ -133,6 +135,26 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	}
 
 	w.rootNid = root.nid
+}
+
+// chunkIndexPad returns the padding inserted between an inode's xattr area and
+// its chunk-index map so the map begins aligned to the chunk-index unit, as the
+// kernel and reader both expect:
+//
+//	pos = ALIGN(iloc + inode_isize + xattr_isize, unit) + unit*chunknr
+//
+// (see fs/erofs/data.c and loadBlock's LayoutChunkBased case). inodeCoreSize is
+// always a multiple of the unit, so only the xattr area can push the map off
+// alignment. Non-chunk layouts (inline data) are read without this alignment
+// and so must not be padded.
+func chunkIndexPad(e *erofsEntry) int {
+	if e.layout != disk.LayoutChunkBased || e.trailingSize == 0 {
+		return 0
+	}
+	if r := (inodeCoreSize(e) + e.xattrSize) % disk.SizeChunkIndex; r != 0 {
+		return disk.SizeChunkIndex - r
+	}
+	return 0
 }
 
 // calcTrailingSize returns the number of bytes following the 64-byte inode.

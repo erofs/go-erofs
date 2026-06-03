@@ -864,6 +864,7 @@ type erofsEntry struct {
 	layout        uint8
 	compact       bool // true = 32-byte compact inode; false = 64-byte extended
 	xattrSize     int  // bytes of xattr area (0 if no xattrs)
+	chunkPad      int  // 8-byte alignment pad between xattr area and chunk-index map
 	trailingSize  int
 
 	// Data block address for flat-plain files (full-image mode)
