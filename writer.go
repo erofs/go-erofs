@@ -119,7 +119,7 @@ func (w *erofsWriter) newMetaBuffer() *bytes.Buffer {
 		if e.compact {
 			isz = disk.SizeInodeCompact
 		}
-		sz := isz + e.xattrSize + e.trailingSize
+		sz := isz + e.xattrSize + e.chunkPad + e.trailingSize
 		if sz%32 != 0 {
 			sz = (sz + 31) & ^31
 		}
@@ -141,7 +141,7 @@ func (w *erofsWriter) assignDataBlocks() {
 		totalMetaBytes := 0
 		for _, e := range w.entries {
 			expectedOff := int(e.nid) * 32
-			sz := inodeCoreSize(e) + e.xattrSize + e.trailingSize
+			sz := inodeCoreSize(e) + e.xattrSize + e.chunkPad + e.trailingSize
 			if sz%32 != 0 {
 				sz = (sz + 31) & ^31
 			}
@@ -197,7 +197,7 @@ func (w *erofsWriter) metadataBytes() int {
 		if curOff < expectedOff {
 			curOff = expectedOff
 		}
-		sz := inodeCoreSize(e) + e.xattrSize + e.trailingSize
+		sz := inodeCoreSize(e) + e.xattrSize + e.chunkPad + e.trailingSize
 		if rem := sz % 32; rem != 0 {
 			sz += 32 - rem
 		}
@@ -311,6 +311,13 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 		switch e.mode & disk.StatTypeMask {
 		case disk.StatTypeReg:
 			if e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0) {
+				// Align the chunk-index map to the chunk-index unit.
+				if e.chunkPad > 0 {
+					if _, err := buf.Write(w.zeroBuf[:e.chunkPad]); err != nil {
+						return err
+					}
+					metaStart += e.chunkPad
+				}
 				if err := w.writeChunkIndexes(buf, e); err != nil {
 					return fmt.Errorf("write chunks for %s: %w", e.path, err)
 				}
@@ -347,7 +354,7 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 		if e.compact {
 			inodeSize = disk.SizeInodeCompact
 		}
-		totalWritten := inodeSize + e.xattrSize + e.trailingSize
+		totalWritten := inodeSize + e.xattrSize + e.chunkPad + e.trailingSize
 		if totalWritten%32 != 0 {
 			padSize := 32 - (totalWritten % 32)
 			if _, err := buf.Write(w.zeroBuf[:padSize]); err != nil {
