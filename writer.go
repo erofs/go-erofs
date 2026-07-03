@@ -116,6 +116,9 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 func (w *erofsWriter) newMetaBuffer() *bytes.Buffer {
 	totalMetaBytes := 0
 	for _, e := range w.entries {
+		if e.hardLinkPrimary != nil {
+			continue // secondary entries share the primary's on-disk inode
+		}
 		isz := disk.SizeInodeExtended
 		if e.compact {
 			isz = disk.SizeInodeCompact
@@ -141,6 +144,9 @@ func (w *erofsWriter) assignDataBlocks() {
 		// Metadata-first: data blocks come after metadata.
 		totalMetaBytes := 0
 		for _, e := range w.entries {
+			if e.hardLinkPrimary != nil {
+				continue
+			}
 			expectedOff := int(e.nid) * 32
 			sz := inodeCoreSize(e) + e.xattrSize + e.trailingSize
 			if sz%32 != 0 {
@@ -154,6 +160,9 @@ func (w *erofsWriter) assignDataBlocks() {
 		metaBlocks := (totalMetaBytes + w.blockSize - 1) / w.blockSize
 		addr := uint32(w.sbAreaBlocks() + metaBlocks)
 		for _, e := range w.entries {
+			if e.hardLinkPrimary != nil {
+				continue
+			}
 			if ds := w.flatPlainDataSize(e); ds > 0 {
 				e.dataBlkAddr = addr
 				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
@@ -163,6 +172,9 @@ func (w *erofsWriter) assignDataBlocks() {
 		// Data-first: data starts after superblock area.
 		addr := uint32(w.sbAreaBlocks())
 		for _, e := range w.entries {
+			if e.hardLinkPrimary != nil {
+				continue // secondary entries share the primary's data blocks
+			}
 			if ds := w.flatPlainDataSize(e); ds > 0 {
 				e.dataBlkAddr = addr
 				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
@@ -194,6 +206,9 @@ func (w *erofsWriter) sbAreaBlocks() int {
 func (w *erofsWriter) metadataBytes() int {
 	curOff := 0
 	for _, e := range w.entries {
+		if e.hardLinkPrimary != nil {
+			continue // secondary entries have no on-disk inode
+		}
 		expectedOff := int(e.nid) * 32
 		if curOff < expectedOff {
 			curOff = expectedOff
@@ -213,9 +228,12 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	totalMetaBytes := w.metadataBytes()
 	metaBlocks := (totalMetaBytes + w.blockSize - 1) / w.blockSize
 
-	// Count data blocks.
+	// Count data blocks (skip secondary hard-link entries).
 	dataBlocks := 0
 	for _, e := range w.entries {
+		if e.hardLinkPrimary != nil {
+			continue
+		}
 		if ds := w.flatPlainDataSize(e); ds > 0 {
 			dataBlocks += (ds + w.blockSize - 1) / w.blockSize
 		}
@@ -283,6 +301,11 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 	metaStart := 0
 	for _, e := range w.entries {
+		// Secondary hard-link entries share the primary's on-disk inode.
+		if e.hardLinkPrimary != nil {
+			continue
+		}
+
 		expectedOff := int(e.nid) * 32
 		if expectedOff > metaStart {
 			if _, err := buf.Write(w.zeroBuf[:expectedOff-metaStart]); err != nil {
@@ -317,12 +340,18 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 				}
 				metaStart += e.trailingSize
 			} else if e.layout == disk.LayoutFlatInline && e.size > 0 && e.data != nil {
-				n, err := io.CopyBuffer(onlyWriter{buf}, io.LimitReader(e.data, int64(e.size)), w.copyBuf)
+				// e.data may be an unbounded reader (e.g. directData from CopyFrom);
+				// limit to e.size bytes to prevent overwriting subsequent metadata.
+				expected := int64(e.size)
+				n, err := io.CopyBuffer(onlyWriter{buf}, io.LimitReader(e.data, expected), w.copyBuf)
 				if c, ok := e.data.(io.Closer); ok {
 					_ = c.Close()
 				}
 				if err != nil {
 					return fmt.Errorf("write inline data for %s: %w", e.path, err)
+				}
+				if n != expected {
+					return fmt.Errorf("write inline data for %s: short read: got %d bytes, expected %d", e.path, n, expected)
 				}
 				metaStart += int(n)
 			}
@@ -530,11 +559,14 @@ func (w *erofsWriter) writeDirents(buf io.Writer, e *erofsEntry) (int, error) {
 	}
 
 	// Build the full entry list including "." and ".." then sort
-	// alphabetically. EROFS requires dirents to be sorted within
-	// each block; "." and ".." are not guaranteed to be first.
+	// alphabetically. EROFS requires dirents to be sorted within each block;
+	// "." and ".." are not guaranteed to sort first (filenames with ASCII
+	// values below '.' such as '-' or ',' sort before them).
 	allEnts := make([]direntInfo, 0, len(e.children)+2)
-	allEnts = append(allEnts, direntInfo{".", e.nid, disk.FileTypeDir})
-	allEnts = append(allEnts, direntInfo{"..", e.parentNid, disk.FileTypeDir})
+	allEnts = append(allEnts,
+		direntInfo{".", e.nid, disk.FileTypeDir},
+		direntInfo{"..", e.parentNid, disk.FileTypeDir},
+	)
 	for _, c := range e.children {
 		allEnts = append(allEnts, direntInfo{
 			name:     c.name,
@@ -614,6 +646,9 @@ func (w *erofsWriter) writeDirents(buf io.Writer, e *erofsEntry) (int, error) {
 // writeDataBlocks writes data blocks for flat-plain entries directly to out.
 func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 	for _, e := range w.entries {
+		if e.hardLinkPrimary != nil {
+			continue // secondary hard-link entries share the primary's data blocks
+		}
 		ds := w.flatPlainDataSize(e)
 		if ds == 0 {
 			continue
