@@ -3,6 +3,7 @@ package erofs_test
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -2210,4 +2211,996 @@ func statDataRange(t *testing.T, fsys fs.FS, name string) []erofs.DataRange {
 		t.Fatalf("FileInfo for %s does not implement DataRange()", name)
 	}
 	return dr.DataRange()
+}
+
+// ---------------------------------------------------------------------------
+// Tests for new features: WriterStat (Sys), ReadLink/Lstat, Link
+// ---------------------------------------------------------------------------
+
+// TestWriterSys verifies that FileInfo.Sys() returns a *WriterStat with
+// correct UID, GID, Rdev, Mtime, Nlink, and Xattrs — all accessible before
+// Close is called.
+func TestWriterSys(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	// Regular file with ownership, custom mtime, and xattr.
+	f, err := fsys.Create("/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Chown(1000, 2000); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Chtimes("/file.txt", time.Time{}, time.Unix(1700000000, 999)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Setxattr("/file.txt", "user.foo", "bar"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Directory.
+	if err := fsys.Mkdir("/dir", 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Chown("/dir", 500, 600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlink.
+	if err := fsys.Symlink("file.txt", "/link"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Character device (whiteout style: rdev=0).
+	if err := fsys.Mknod("/null", disk.StatTypeChrdev, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Chown("/null", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- Check regular file ---
+	fi, err := fsys.Stat("/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, ok := fi.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("Sys() returned %T, want *erofs.WriterStat", fi.Sys())
+	}
+	if ws.UID != 1000 {
+		t.Errorf("file UID = %d, want 1000", ws.UID)
+	}
+	if ws.GID != 2000 {
+		t.Errorf("file GID = %d, want 2000", ws.GID)
+	}
+	if ws.Mtime != 1700000000 {
+		t.Errorf("file Mtime = %d, want 1700000000", ws.Mtime)
+	}
+	if ws.MtimeNs != 999 {
+		t.Errorf("file MtimeNs = %d, want 999", ws.MtimeNs)
+	}
+	if ws.Nlink != 1 {
+		t.Errorf("file Nlink = %d, want 1", ws.Nlink)
+	}
+	if ws.Xattrs["user.foo"] != "bar" {
+		t.Errorf("file xattr user.foo = %q, want %q", ws.Xattrs["user.foo"], "bar")
+	}
+
+	// --- Check directory ---
+	di, err := fsys.Stat("/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dws, ok := di.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("dir Sys() returned %T, want *erofs.WriterStat", di.Sys())
+	}
+	if dws.UID != 500 {
+		t.Errorf("dir UID = %d, want 500", dws.UID)
+	}
+	if dws.GID != 600 {
+		t.Errorf("dir GID = %d, want 600", dws.GID)
+	}
+	if dws.Nlink != 2 { // directory nlink starts at 2 (self + parent)
+		t.Errorf("dir Nlink = %d, want 2", dws.Nlink)
+	}
+
+	// --- Check symlink ---
+	li, err := fsys.Stat("/link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lws, ok := li.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("link Sys() returned %T, want *erofs.WriterStat", li.Sys())
+	}
+	if lws.Nlink != 1 {
+		t.Errorf("symlink Nlink = %d, want 1", lws.Nlink)
+	}
+
+	// --- Check char device ---
+	ni, err := fsys.Stat("/null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nws, ok := ni.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("device Sys() returned %T, want *erofs.WriterStat", ni.Sys())
+	}
+	if nws.Rdev != 0 {
+		t.Errorf("device Rdev = %d, want 0", nws.Rdev)
+	}
+
+	// --- Verify WriterStat xattr map is a copy (mutations don't affect writer) ---
+	ws.Xattrs["user.foo"] = "mutated"
+	fi2, _ := fsys.Stat("/file.txt")
+	ws2, _ := fi2.Sys().(*erofs.WriterStat)
+	if ws2.Xattrs["user.foo"] != "bar" {
+		t.Error("WriterStat Xattrs is not a defensive copy")
+	}
+
+	// --- Verify Sys() is consistent with round-tripped image ---
+	if err := fsys.Close(); err != nil {
+		t.Fatal(err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	imgFI, err := fs.Stat(efs, "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imgSt, ok := imgFI.Sys().(*erofs.Stat)
+	if !ok {
+		t.Fatalf("image Sys() returned %T, want *erofs.Stat", imgFI.Sys())
+	}
+	if imgSt.UID != 1000 {
+		t.Errorf("round-trip UID = %d, want 1000", imgSt.UID)
+	}
+	if imgSt.GID != 2000 {
+		t.Errorf("round-trip GID = %d, want 2000", imgSt.GID)
+	}
+	if imgSt.Mtime != 1700000000 {
+		t.Errorf("round-trip Mtime = %d, want 1700000000", imgSt.Mtime)
+	}
+	xval, ok := imgSt.Xattrs["user.foo"]
+	if !ok || xval != "bar" {
+		t.Errorf("round-trip xattr user.foo = %q (ok=%v), want %q", xval, ok, "bar")
+	}
+}
+
+// TestWriterReadLink verifies that ReadLink returns the correct target and
+// errors correctly for non-symlinks. Together with Lstat it checks that
+// Writer implements fs.ReadLinkFS.
+func TestWriterReadLink(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	if err := fsys.Symlink("/some/target", "/link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Symlink("relative/path", "/rellink"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Mkdir("/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := fsys.Create("/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// ReadLink on an absolute symlink.
+	target, err := fsys.ReadLink("/link")
+	if err != nil {
+		t.Fatalf("ReadLink /link: %v", err)
+	}
+	if target != "/some/target" {
+		t.Errorf("ReadLink /link = %q, want %q", target, "/some/target")
+	}
+
+	// ReadLink on a relative symlink.
+	target, err = fsys.ReadLink("/rellink")
+	if err != nil {
+		t.Fatalf("ReadLink /rellink: %v", err)
+	}
+	if target != "relative/path" {
+		t.Errorf("ReadLink /rellink = %q, want %q", target, "relative/path")
+	}
+
+	// ReadLink on a directory must fail.
+	_, err = fsys.ReadLink("/dir")
+	if err == nil {
+		t.Error("ReadLink on directory should fail")
+	}
+
+	// ReadLink on a regular file must fail.
+	_, err = fsys.ReadLink("/file")
+	if err == nil {
+		t.Error("ReadLink on regular file should fail")
+	}
+
+	// ReadLink on a nonexistent path must fail.
+	_, err = fsys.ReadLink("/nonexistent")
+	if err == nil {
+		t.Error("ReadLink on nonexistent path should fail")
+	}
+
+	// Lstat on a symlink does not follow; reports ModeSymlink.
+	fi, err := fsys.Lstat("/link")
+	if err != nil {
+		t.Fatalf("Lstat /link: %v", err)
+	}
+	if fi.Mode().Type() != fs.ModeSymlink {
+		t.Errorf("Lstat /link mode = %v, want symlink", fi.Mode().Type())
+	}
+
+	// Lstat on a directory reports ModeDir.
+	fi, err = fsys.Lstat("/dir")
+	if err != nil {
+		t.Fatalf("Lstat /dir: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Errorf("Lstat /dir: expected directory")
+	}
+
+	// Writer satisfies the readLinker interface (Lstat + ReadLink + Open).
+	type readLinker interface {
+		Lstat(string) (fs.FileInfo, error)
+		ReadLink(string) (string, error)
+	}
+	var _ readLinker = fsys
+
+	// Verify round-trip: after Close + Open, ReadLink still works.
+	if err := fsys.Close(); err != nil {
+		t.Fatal(err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The opened image also implements Lstat + ReadLink.
+	rls, ok := efs.(interface{ ReadLink(string) (string, error) })
+	if !ok {
+		t.Fatal("opened image does not implement ReadLink")
+	}
+	imgTarget, err := rls.ReadLink("link")
+	if err != nil {
+		t.Fatalf("image ReadLink link: %v", err)
+	}
+	if imgTarget != "/some/target" {
+		t.Errorf("image ReadLink link = %q, want %q", imgTarget, "/some/target")
+	}
+}
+
+// TestWriterLink verifies that Link creates a hard link: both names resolve
+// to the same inode, nlink is updated on both, and the data is shared.
+func TestWriterLink(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	// Create a file then hard-link it.
+	f, err := fsys.Create("/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("shared content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Chown(42, 43); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fsys.Link("/original", "/hardlink"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both entries should report nlink == 2 via Sys().
+	orig, err := fsys.Stat("/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ows, ok := orig.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("Sys() %T, want *WriterStat", orig.Sys())
+	}
+	if ows.Nlink != 2 {
+		t.Errorf("original Nlink = %d, want 2", ows.Nlink)
+	}
+
+	link, err := fsys.Stat("/hardlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lws, ok := link.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("Sys() %T, want *WriterStat", link.Sys())
+	}
+	if lws.Nlink != 2 {
+		t.Errorf("hardlink Nlink = %d, want 2", lws.Nlink)
+	}
+
+	// Data is readable through the hard link.
+	hf, err := fsys.Open("/hardlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(hf)
+	if cerr := hf.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "shared content" {
+		t.Errorf("hardlink data = %q, want %q", data, "shared content")
+	}
+
+	// Third link: nlink becomes 3.
+	if err := fsys.Mkdir("/subdir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/original", "/subdir/link3"); err != nil {
+		t.Fatal(err)
+	}
+	orig3, err := fsys.Stat("/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws3, _ := orig3.Sys().(*erofs.WriterStat); ws3.Nlink != 3 {
+		t.Errorf("after third link, Nlink = %d, want 3", ws3.Nlink)
+	}
+
+	// Link errors: nonexistent source.
+	if err := fsys.Link("/nonexistent", "/dst"); err == nil {
+		t.Error("Link nonexistent source should fail")
+	}
+
+	// Link errors: duplicate destination.
+	if err := fsys.Link("/original", "/hardlink"); err == nil {
+		t.Error("Link to existing destination should fail")
+	}
+
+	// Link errors: directory source.
+	if err := fsys.Link("/subdir", "/dirlink"); err == nil {
+		t.Error("Link of directory should fail")
+	}
+
+	// Verify round-trip: nlink and data must survive Close + Open.
+	if err := fsys.Close(); err != nil {
+		t.Fatal(err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	erofstest.CheckFile(t, efs, "original", "shared content")
+	erofstest.CheckFile(t, efs, "hardlink", "shared content")
+	erofstest.CheckFile(t, efs, "subdir/link3", "shared content")
+
+	imgFI, err := fs.Stat(efs, "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imgSt, ok := imgFI.Sys().(*erofs.Stat)
+	if !ok {
+		t.Fatalf("image Sys() %T, want *erofs.Stat", imgFI.Sys())
+	}
+	if imgSt.Nlink != 3 {
+		t.Errorf("image nlink = %d, want 3", imgSt.Nlink)
+	}
+
+	// All three names must share the same inode number.
+	liFI, err := fs.Stat(efs, "hardlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	liSt, _ := liFI.Sys().(*erofs.Stat)
+	l3FI, err := fs.Stat(efs, "subdir/link3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l3St, _ := l3FI.Sys().(*erofs.Stat)
+
+	if imgSt.Ino != liSt.Ino {
+		t.Errorf("original ino %d != hardlink ino %d", imgSt.Ino, liSt.Ino)
+	}
+	if imgSt.Ino != l3St.Ino {
+		t.Errorf("original ino %d != link3 ino %d", imgSt.Ino, l3St.Ino)
+	}
+}
+
+// TestWriterLinkSharedInode verifies that hard links share the inode: a link
+// taken before the source file is closed still sees the final data and size,
+// and a metadata change through one name is visible through the other.
+func TestWriterLinkSharedInode(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	f, err := fsys.Create("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Link before any data is written and before Close.
+	if err := fsys.Link("/a", "/b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("late content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The link must see the final size and data written after Link.
+	bi, err := fsys.Stat("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bi.Size() != int64(len("late content")) {
+		t.Errorf("link size = %d, want %d", bi.Size(), len("late content"))
+	}
+	bf, err := fsys.Open("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(bf)
+	if cerr := bf.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "late content" {
+		t.Errorf("link data = %q, want %q", data, "late content")
+	}
+
+	// Metadata change through one name is visible through the other.
+	if err := fsys.Chown("/a", 7, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Chmod("/b", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ai, err := fsys.Stat("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := ai.Sys().(*erofs.WriterStat)
+	if as.UID != 7 || as.GID != 8 {
+		t.Errorf("source owner = %d:%d, want 7:8", as.UID, as.GID)
+	}
+	if ai.Mode().Perm() != 0o600 {
+		t.Errorf("source mode = %o, want 600 (chmod via link)", ai.Mode().Perm())
+	}
+
+	// A link of a link resolves to the same single inode owner.
+	if err := fsys.Link("/b", "/c"); err != nil {
+		t.Fatal(err)
+	}
+	ci := fsvStat(t, fsys, "/c")
+	if ci.Sys().(*erofs.WriterStat).Nlink != 3 {
+		t.Errorf("nlink after chained link = %d, want 3", ci.Sys().(*erofs.WriterStat).Nlink)
+	}
+}
+
+// fsvStat is a small helper to stat and fail the test on error.
+func fsvStat(t *testing.T, fsys *erofs.Writer, name string) fs.FileInfo {
+	t.Helper()
+	fi, err := fsys.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}
+
+// TestWriterSymlinkTraversal verifies that the Writer does not follow symlinks
+// during lookup and reports an explicit ErrNotDirectory when a path traverses
+// through a symlink or a regular file, distinguishing misuse from a plain miss.
+func TestWriterSymlinkTraversal(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	if err := fsys.Mkdir("/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	df, err := fsys.Create("/dir/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := df.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Symlink("/dir", "/link"); err != nil {
+		t.Fatal(err)
+	}
+	rf, err := fsys.Create("/regular")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Traversal through a symlink is not supported: explicit ErrNotDirectory,
+	// not a bare ErrNotExist.
+	for _, op := range []struct {
+		name string
+		fn   func(string) error
+	}{
+		{"open", func(p string) error { _, e := fsys.Open(p); return e }},
+		{"stat", func(p string) error { _, e := fsys.Stat(p); return e }},
+		{"readlink", func(p string) error { _, e := fsys.ReadLink(p); return e }},
+	} {
+		err := op.fn("/link/file")
+		if !errors.Is(err, erofs.ErrNotDirectory) {
+			t.Errorf("%s through symlink: got %v, want ErrNotDirectory", op.name, err)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s through symlink should not report ErrNotExist", op.name)
+		}
+	}
+
+	// Traversal through a regular file is also ErrNotDirectory.
+	if _, err := fsys.Open("/regular/child"); !errors.Is(err, erofs.ErrNotDirectory) {
+		t.Errorf("open through regular file: got %v, want ErrNotDirectory", err)
+	}
+
+	// A genuinely absent path under a real directory is ErrNotExist.
+	if _, err := fsys.Open("/dir/missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("open missing path: got %v, want ErrNotExist", err)
+	}
+	if errors.Is(func() error { _, e := fsys.Open("/dir/missing"); return e }(), erofs.ErrNotDirectory) {
+		t.Error("missing path should not report ErrNotDirectory")
+	}
+
+	// ReadLink on the symlink itself still works.
+	target, err := fsys.ReadLink("/link")
+	if err != nil {
+		t.Fatalf("ReadLink /link: %v", err)
+	}
+	if target != "/dir" {
+		t.Errorf("ReadLink /link = %q, want /dir", target)
+	}
+}
+
+// TestWriterLinkRemoveNlink verifies that removing a hard-linked name via a
+// whiteout (Merge) decrements the shared nlink counter, so the surviving names
+// report the correct count.
+func TestWriterLinkRemoveNlink(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	// Create three names for one inode.
+	f, err := fsys.Create("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/a", "/b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/a", "/c"); err != nil {
+		t.Fatal(err)
+	}
+
+	checkNlink := func(name string, want uint32) {
+		t.Helper()
+		fi, err := fsys.Stat(name)
+		if err != nil {
+			t.Fatalf("Stat %s: %v", name, err)
+		}
+		ws, ok := fi.Sys().(*erofs.WriterStat)
+		if !ok {
+			t.Fatalf("Sys() %T", fi.Sys())
+		}
+		if ws.Nlink != want {
+			t.Errorf("%s: Nlink = %d, want %d", name, ws.Nlink, want)
+		}
+	}
+
+	checkNlink("/a", 3)
+	checkNlink("/b", 3)
+	checkNlink("/c", 3)
+
+	// Simulate a whiteout removing /b via a Merge layer.
+	// Merge uses AUFS-style whiteouts: a file named ".wh.<target>".
+	var buf2 testBuffer
+	layer := erofs.Create(&buf2)
+	wh, err := layer.Create("/.wh.b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := layer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	layerFS, err := erofs.Open(bytes.NewReader(buf2.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.CopyFrom(layerFS, erofs.Merge()); err != nil {
+		t.Fatal(err)
+	}
+
+	// /b is gone; /a and /c nlink should now be 2.
+	if _, err := fsys.Stat("/b"); err == nil {
+		t.Error("/b should be absent after whiteout")
+	}
+	checkNlink("/a", 2)
+	checkNlink("/c", 2)
+
+	// The round-tripped image must also reflect nlink=2.
+	if err := fsys.Close(); err != nil {
+		t.Fatal(err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aFI, err := fs.Stat(efs, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aSt, ok := aFI.Sys().(*erofs.Stat)
+	if !ok {
+		t.Fatalf("image Sys() %T", aFI.Sys())
+	}
+	if aSt.Nlink != 2 {
+		t.Errorf("image nlink = %d, want 2", aSt.Nlink)
+	}
+}
+
+// TestWriterHardLinkReadDir verifies that ReadDir on a directory containing a
+// hard link returns the correct Type(), IsDir(), and Info() for the link entry
+// before Close is called. Secondary hard-link fsEntries carry no mode of their
+// own; dirEntry must resolve through the inode owner.
+func TestWriterHardLinkReadDir(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	// Create a regular file and a symlink, then hard-link the file.
+	f, err := fsys.Create("/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Chown(10, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Symlink("original", "/sym"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/original", "/hardlink"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open root as a directory and read its entries.
+	d, err := fsys.Open("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rdf, ok := d.(fs.ReadDirFile)
+	if !ok {
+		t.Fatal("root Open did not return ReadDirFile")
+	}
+	entries, err := rdf.ReadDir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	byName := make(map[string]fs.DirEntry, len(entries))
+	for _, e := range entries {
+		byName[e.Name()] = e
+	}
+
+	// "original": regular file.
+	orig, ok := byName["original"]
+	if !ok {
+		t.Fatal("original not found in ReadDir")
+	}
+	if orig.IsDir() {
+		t.Error("original: IsDir() should be false")
+	}
+	if orig.Type() != 0 {
+		t.Errorf("original: Type() = %v, want 0 (regular)", orig.Type())
+	}
+
+	// "hardlink": secondary hard-link entry — must reflect the source's mode.
+	hl, ok := byName["hardlink"]
+	if !ok {
+		t.Fatal("hardlink not found in ReadDir")
+	}
+	if hl.IsDir() {
+		t.Error("hardlink: IsDir() should be false for a regular file hard link")
+	}
+	if hl.Type() != 0 {
+		t.Errorf("hardlink: Type() = %v, want 0 (regular); got wrong type (mode not resolved through inode)", hl.Type())
+	}
+	hlInfo, err := hl.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hlInfo.Mode().Perm() == 0 {
+		t.Error("hardlink: Info().Mode().Perm() is zero; inode not resolved")
+	}
+	hlStat, ok := hlInfo.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("hardlink Info Sys() = %T, want *WriterStat", hlInfo.Sys())
+	}
+	if hlStat.UID != 10 || hlStat.GID != 20 {
+		t.Errorf("hardlink owner = %d:%d, want 10:20", hlStat.UID, hlStat.GID)
+	}
+	if hlStat.Nlink != 2 {
+		t.Errorf("hardlink Nlink = %d, want 2", hlStat.Nlink)
+	}
+
+	// "sym": symlink.
+	sym, ok := byName["sym"]
+	if !ok {
+		t.Fatal("sym not found in ReadDir")
+	}
+	if sym.IsDir() {
+		t.Error("sym: IsDir() should be false")
+	}
+	if sym.Type() != fs.ModeSymlink {
+		t.Errorf("sym: Type() = %v, want ModeSymlink", sym.Type())
+	}
+}
+
+// TestWriterLinkWhiteoutPrimary verifies that whiting out the original name
+// of a hard-link set leaves the surviving names intact: data, nlink, and the
+// shared on-disk inode (identical Ino) must all be correct. Under the old
+// primary/linkSource model this worked by accident; under the shared-*fsInode
+// model it is guaranteed regardless of which name is removed.
+func TestWriterLinkWhiteoutPrimary(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	// /original is the first name created; /b and /c are hard links.
+	f, err := fsys.Create("/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("inode content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Chown(11, 22); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/original", "/b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/original", "/c"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whiteout /original (the primary name) via a Merge layer.
+	var wbuf testBuffer
+	layer := erofs.Create(&wbuf)
+	wh, err := layer.Create("/.wh.original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := layer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	layerFS, err := erofs.Open(bytes.NewReader(wbuf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.CopyFrom(layerFS, erofs.Merge()); err != nil {
+		t.Fatal(err)
+	}
+
+	// /original must be gone.
+	if _, err := fsys.Stat("/original"); err == nil {
+		t.Error("/original should be absent after whiteout")
+	}
+
+	// /b and /c must survive with nlink=2 and correct metadata.
+	for _, name := range []string{"/b", "/c"} {
+		fi, err := fsys.Stat(name)
+		if err != nil {
+			t.Fatalf("Stat %s: %v", name, err)
+		}
+		ws, ok := fi.Sys().(*erofs.WriterStat)
+		if !ok {
+			t.Fatalf("%s Sys() = %T", name, fi.Sys())
+		}
+		if ws.Nlink != 2 {
+			t.Errorf("%s Nlink = %d, want 2", name, ws.Nlink)
+		}
+		if ws.UID != 11 || ws.GID != 22 {
+			t.Errorf("%s owner = %d:%d, want 11:22", name, ws.UID, ws.GID)
+		}
+	}
+
+	// Data must be readable through both surviving names.
+	for _, name := range []string{"/b", "/c"} {
+		rf, err := fsys.Open(name)
+		if err != nil {
+			t.Fatalf("Open %s: %v", name, err)
+		}
+		data, err := io.ReadAll(rf)
+		_ = rf.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "inode content" {
+			t.Errorf("%s data = %q, want %q", name, data, "inode content")
+		}
+	}
+
+	// Round-trip: /b and /c share exactly one on-disk inode (same Ino).
+	if err := fsys.Close(); err != nil {
+		t.Fatal(err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	erofstest.CheckFile(t, efs, "b", "inode content")
+	erofstest.CheckFile(t, efs, "c", "inode content")
+
+	bFI, err := fs.Stat(efs, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cFI, err := fs.Stat(efs, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bSt := bFI.Sys().(*erofs.Stat)
+	cSt := cFI.Sys().(*erofs.Stat)
+
+	if bSt.Nlink != 2 {
+		t.Errorf("image b Nlink = %d, want 2", bSt.Nlink)
+	}
+	if bSt.Ino != cSt.Ino {
+		t.Errorf("b ino %d != c ino %d: should share one on-disk inode", bSt.Ino, cSt.Ino)
+	}
+}
+
+// TestWriterLinkOverwriteNlink verifies that overwriting a hard-linked name
+// via CopyFrom (merge overwrite semantics) decrements the shared nlink so
+// the surviving names report the correct count. Before the fix, existing.ino
+// was swapped without calling unlinkInode, leaving the shared nlink inflated.
+func TestWriterLinkOverwriteNlink(t *testing.T) {
+	var buf testBuffer
+	fsys := erofs.Create(&buf)
+
+	// /a and /b share one inode; nlink = 2.
+	f, err := fsys.Create("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link("/a", "/b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Overwrite /b via a Merge layer with a new, independent file.
+	var wbuf testBuffer
+	layer := erofs.Create(&wbuf)
+	lf, err := layer.Create("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lf.Write([]byte("replacement")); err != nil {
+		t.Fatal(err)
+	}
+	if err := lf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := layer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	layerFS, err := erofs.Open(bytes.NewReader(wbuf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.CopyFrom(layerFS, erofs.Merge()); err != nil {
+		t.Fatal(err)
+	}
+
+	// /a's shared inode now has only one name; nlink must be 1.
+	ai, err := fsys.Stat("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aws, ok := ai.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("/a Sys() = %T, want *WriterStat", ai.Sys())
+	}
+	if aws.Nlink != 1 {
+		t.Errorf("/a Nlink = %d, want 1 after /b was overwritten", aws.Nlink)
+	}
+
+	// /b is now an independent file with its own inode.
+	bi, err := fsys.Stat("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bws, ok := bi.Sys().(*erofs.WriterStat)
+	if !ok {
+		t.Fatalf("/b Sys() = %T, want *WriterStat", bi.Sys())
+	}
+	if bws.Nlink != 0 && bws.Nlink != 1 {
+		t.Errorf("/b Nlink = %d, want 0 or 1 (standalone)", bws.Nlink)
+	}
+
+	// Round-trip: /a must appear as a standalone inode with nlink=1.
+	if err := fsys.Close(); err != nil {
+		t.Fatal(err)
+	}
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	erofstest.CheckFile(t, efs, "a", "original")
+	erofstest.CheckFile(t, efs, "b", "replacement")
+
+	aFI, err := fs.Stat(efs, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aSt, ok := aFI.Sys().(*erofs.Stat)
+	if !ok {
+		t.Fatalf("image /a Sys() = %T, want *Stat", aFI.Sys())
+	}
+	if aSt.Nlink != 1 {
+		t.Errorf("image /a Nlink = %d, want 1", aSt.Nlink)
+	}
+
+	bFI, err := fs.Stat(efs, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bSt, ok := bFI.Sys().(*erofs.Stat)
+	if !ok {
+		t.Fatalf("image /b Sys() = %T, want *Stat", bFI.Sys())
+	}
+	// /a and /b must have distinct inodes now.
+	if aSt.Ino == bSt.Ino {
+		t.Errorf("/a ino %d == /b ino %d: should be distinct after overwrite", aSt.Ino, bSt.Ino)
+	}
 }
