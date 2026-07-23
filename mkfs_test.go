@@ -2048,6 +2048,69 @@ func TestCopyFromDataRange(t *testing.T) {
 	})
 }
 
+// TestCopyFromDataRangeNonContiguousSmallBlockSize is a regression test for
+// a chunk-index data-loss bug: a non-contiguous chunk-based file (a hole
+// followed by real data) at a block size smaller than 4096 must read back
+// correctly. The writer's default logical chunk size is derived from the
+// block size (floored to at least 4096 bytes), not from the source's
+// actual extent granularity, so a hole and the data that follows it can
+// both fall within a single logical chunk. writeChunkIndexes only
+// inspected the first raw chunk covering that window and treated the
+// entire span as a hole, silently discarding the real data that followed.
+func TestCopyFromDataRangeNonContiguousSmallBlockSize(t *testing.T) {
+	const blockSize = 1024
+	const deviceBlocks = 17
+
+	pattern := make([]byte, deviceBlocks*blockSize)
+	for i := range pattern {
+		pattern[i] = byte(i) ^ 0x5A
+	}
+
+	// File layout: a 1024-byte hole, then 1024 bytes of real data at
+	// physical block 0. Both chunks fit within one 4096-byte logical
+	// chunk (the writer's default chunk size floor when blockSize <
+	// 4096), so they must not be coalesced into a single chunk-index
+	// entry.
+	src := &dataRangerFS{
+		deviceBlocks: deviceBlocks,
+		file: &dataRangerFileInfo{
+			name: "sparse.bin",
+			size: blockSize * 2,
+			ranges: []erofs.DataRange{
+				{Offset: -1, Size: blockSize},
+				{Device: 0, Offset: 0, Size: blockSize},
+			},
+		},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithBlockSize(blockSize))
+	if err := w.CopyFrom(src, erofs.MetadataOnly()); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()), erofs.WithExtraDevices(bytes.NewReader(pattern)))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	want := make([]byte, blockSize*2)
+	copy(want[blockSize:], pattern[:blockSize])
+
+	got, err := fs.ReadFile(efs, "sparse.bin")
+	if err != nil {
+		t.Fatal("ReadFile:", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("content mismatch (chunk-index coalescing dropped real data): got % x, want % x", got, want)
+	}
+}
+
 // TestChunksFromRangesValidation verifies that chunksFromRanges rejects
 // invalid DataRange inputs instead of silently producing corrupt chunk entries.
 func TestChunksFromRangesValidation(t *testing.T) {

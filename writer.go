@@ -49,9 +49,15 @@ func inodeCoreSize(e *erofsEntry) int {
 
 // entryChunkBits returns the chunk bits for a specific entry.
 // Contiguous entries use a larger chunk size to minimize chunk indexes.
+// Non-contiguous entries have chunkBits explicitly forced to 0 by
+// planLayout so that writeChunkIndexes never coalesces multiple distinct
+// physical mappings (data at different blocks/devices, or holes) into a
+// single on-disk chunk-index entry. e.chunkBits is -1 until planLayout
+// assigns it (0 is itself a valid override, so it cannot double as the
+// "unset" sentinel).
 func (w *erofsWriter) entryChunkBits(e *erofsEntry) uint8 {
-	if e.chunkBits > 0 {
-		return e.chunkBits
+	if e.chunkBits >= 0 {
+		return uint8(e.chunkBits)
 	}
 	return w.chunkBits
 }
