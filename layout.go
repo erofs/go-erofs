@@ -63,7 +63,27 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 			case len(e.chunks) > 0 || e.metadataOnly:
 				e.layout = disk.LayoutChunkBased
 				if e.contiguous {
-					e.chunkBits = w.minChunkBits(e.size)
+					// A single contiguous extent has no risk of mixing
+					// distinct physical mappings within one logical chunk,
+					// so a larger chunk size is safe and reduces the
+					// number of on-disk chunk-index entries. minChunkBits
+					// is capped at 31, so this always fits in int8.
+					e.chunkBits = int8(w.minChunkBits(e.size))
+				} else {
+					// Non-contiguous (heterogeneous) chunk lists may
+					// interleave holes and data (or different physical
+					// blocks/devices) within a span shorter than the
+					// writer's default logical chunk size. Force
+					// block-granularity chunking (chunkBits=0) so every
+					// on-disk chunk-index entry maps to exactly one
+					// physical block, matching the block-level
+					// granularity of e.chunks. Without this,
+					// writeChunkIndexes would only inspect the first raw
+					// chunk overlapping a coarser logical chunk and could
+					// silently drop real data that follows within the
+					// same logical chunk (see erofs/go-erofs data-loss
+					// bug found by FuzzChunksFromRanges).
+					e.chunkBits = 0
 				}
 			default:
 				// Full-image mode: decide inline vs plain
