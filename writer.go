@@ -25,18 +25,20 @@ type onlyWriter struct{ io.Writer }
 
 // erofsWriter serializes EROFS metadata to an io.Writer.
 type erofsWriter struct {
-	entries     []*erofsEntry // all entries in NID order
-	rootNid     uint64
-	metaBlkAddr uint32
-	totalInodes uint64
-	buildTime   uint64
-	buildTimeNs uint32
-	devices     []uint64 // per-device block counts (one slot per entry)
-	blockSize   int
-	chunkBits   uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
-	copyBuf     []byte                       // reusable buffer for io.CopyBuffer
-	zeroBuf     []byte                       // blockSize-length zero buffer for padding
-	inodeBuf    [disk.SizeInodeExtended]byte // scratch buffer for writeInode
+	entries         []*erofsEntry // all entries in NID order
+	rootNid         uint64
+	metaBlkAddr     uint32
+	totalInodes     uint64
+	buildTime       uint64
+	buildTimeNs     uint32
+	uuid            [16]uint8
+	devices         []uint64 // per-device block counts (one slot per entry)
+	blockSize       int
+	chunkBits       uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
+	inlineThreshold int                          // see WithInlineThreshold
+	copyBuf         []byte                       // reusable buffer for io.CopyBuffer
+	zeroBuf         []byte                       // blockSize-length zero buffer for padding
+	inodeBuf        [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 }
 
 // inodeSize returns the on-disk inode header size for e.
@@ -80,12 +82,9 @@ func (w *erofsWriter) write(out io.WriteSeeker) error {
 // data blocks, metadata. After everything is written, it seeks back to
 // write the real superblock. This matches how mkfs.erofs lays out
 // streaming sources — data is written as it arrives, metadata last.
+//
+// Data block addresses must already be assigned (see assignDataBlocks).
 func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
-	// Data-first layout: sbArea, data blocks, metadata.
-	// Set metaBlkAddr to a sentinel so assignDataBlocks uses data-first.
-	w.metaBlkAddr = 0xFFFFFFFF
-	w.assignDataBlocks()
-
 	// Write placeholder superblock area.
 	if _, err := out.Write(make([]byte, w.sbAreaSize())); err != nil {
 		return err
@@ -135,24 +134,14 @@ func (w *erofsWriter) newMetaBuffer() *bytes.Buffer {
 // assignDataBlocks assigns data block addresses to flat-plain entries.
 // For metadata-first layout, data follows metadata.
 // For data-first layout, data starts after the superblock area.
+// Entries that share another entry's extent get no address here; see
+// resolveSharedData.
 func (w *erofsWriter) assignDataBlocks() {
 	sbBlks := w.sbAreaBlocks()
 	if w.metaBlkAddr == uint32(sbBlks) {
 		// Metadata-first: data blocks come after metadata.
-		totalMetaBytes := 0
-		for _, e := range w.entries {
-			expectedOff := int(e.nid) * 32
-			sz := inodeCoreSize(e) + e.xattrSize + e.chunkPad + e.trailingSize
-			if sz%32 != 0 {
-				sz = (sz + 31) & ^31
-			}
-			end := expectedOff + sz
-			if end > totalMetaBytes {
-				totalMetaBytes = end
-			}
-		}
-		metaBlocks := (totalMetaBytes + w.blockSize - 1) / w.blockSize
-		addr := uint32(w.sbAreaBlocks() + metaBlocks)
+		metaBlocks := (w.metadataBytes() + w.blockSize - 1) / w.blockSize
+		addr := uint32(sbBlks + metaBlocks)
 		for _, e := range w.entries {
 			if ds := w.flatPlainDataSize(e); ds > 0 {
 				e.dataBlkAddr = addr
@@ -161,7 +150,7 @@ func (w *erofsWriter) assignDataBlocks() {
 		}
 	} else {
 		// Data-first: data starts after superblock area.
-		addr := uint32(w.sbAreaBlocks())
+		addr := uint32(sbBlks)
 		for _, e := range w.entries {
 			if ds := w.flatPlainDataSize(e); ds > 0 {
 				e.dataBlkAddr = addr
@@ -169,6 +158,37 @@ func (w *erofsWriter) assignDataBlocks() {
 			}
 		}
 		w.metaBlkAddr = addr // metadata follows data
+	}
+}
+
+// resolveSharedData points every entry created by Writer.ShareData at its
+// source's data extent. It must run after assignDataBlocks, which is what
+// gives the source its address.
+func (w *erofsWriter) resolveSharedData() error {
+	for _, e := range w.entries {
+		src := e.shareSrc
+		if src == nil {
+			continue
+		}
+		if src.layout != disk.LayoutFlatPlain {
+			// planLayout forces a shared source out of line, so this can only
+			// trip if that invariant is broken.
+			return fmt.Errorf("mkfs: %s shares data with %s, which is not stored out of line", e.path, src.path)
+		}
+		e.dataBlkAddr = src.dataBlkAddr
+	}
+	return nil
+}
+
+// extentKind classifies an entry's out-of-line payload.
+func extentKind(e *erofsEntry) ExtentKind {
+	switch e.mode & disk.StatTypeMask {
+	case disk.StatTypeDir:
+		return ExtentDirents
+	case disk.StatTypeSymlink:
+		return ExtentSymlink
+	default:
+		return ExtentFileData
 	}
 }
 
@@ -247,6 +267,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		BuildTimeNs:     w.buildTimeNs,
 		Blocks:          uint32(totalBlocks),
 		MetaBlkAddr:     w.metaBlkAddr,
+		UUID:            w.uuid,
 		FeatureIncompat: featureIncompat,
 		ExtraDevices:    extraDevices,
 		DevtSlotOff:     devtSlotOff,
@@ -543,10 +564,13 @@ func (w *erofsWriter) writeDirents(buf io.Writer, e *erofsEntry) (int, error) {
 	allEnts = append(allEnts, direntInfo{".", e.nid, disk.FileTypeDir})
 	allEnts = append(allEnts, direntInfo{"..", e.parentNid, disk.FileTypeDir})
 	for _, c := range e.children {
+		// A hardlink has no inode of its own: its dirent resolves to the
+		// target's NID and reports the target's file type.
+		target := direntTarget(c)
 		allEnts = append(allEnts, direntInfo{
 			name:     c.name,
-			nid:      c.nid,
-			fileType: c.erofsFileType,
+			nid:      target.nid,
+			fileType: target.erofsFileType,
 		})
 	}
 	sort.Slice(allEnts, func(i, j int) bool {

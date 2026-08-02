@@ -14,7 +14,12 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	w.entries = nil
 	var walk func(e *erofsEntry)
 	walk = func(e *erofsEntry) {
-		w.entries = append(w.entries, e)
+		// Hardlinks are extra dirents for an existing inode, so they get no
+		// inode (and no NID) of their own. They are never directories, so
+		// there is nothing to recurse into either.
+		if e.hardlinkTo == nil {
+			w.entries = append(w.entries, e)
+		}
 		if e.mode&disk.StatTypeMask == disk.StatTypeDir {
 			sort.Slice(e.children, func(i, j int) bool {
 				return e.children[i].name < e.children[j].name
@@ -29,7 +34,7 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	w.totalInodes = uint64(len(w.entries))
 
 	// Block 0 holds: 1024-byte pad + 128-byte superblock + device slot(s) + padding
-	// MetaBlkAddr is set later by write() depending on the on-disk layout.
+	// MetaBlkAddr is set later by the finalizer depending on the on-disk layout.
 
 	// Assign NIDs sequentially.
 	// NID = byte offset from metaStartPos / 32.
@@ -58,6 +63,10 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 		switch e.mode & disk.StatTypeMask {
 		case disk.StatTypeReg:
 			switch {
+			case e.shareSrc != nil:
+				// References another inode's extent; nothing of its own to
+				// store, and inlining would defeat the sharing.
+				e.layout = disk.LayoutFlatPlain
 			case e.size == 0 && len(e.chunks) == 0 && e.data == nil && !e.metadataOnly:
 				e.layout = disk.LayoutFlatPlain
 			case len(e.chunks) > 0 || e.metadataOnly:
@@ -65,6 +74,8 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 				if e.contiguous {
 					e.chunkBits = w.minChunkBits(e.size)
 				}
+			case !w.mayInline(e):
+				e.layout = disk.LayoutFlatPlain
 			default:
 				// Full-image mode: decide inline vs plain
 				if int(e.size) <= w.blockSize-headerSize {
@@ -135,6 +146,24 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	}
 
 	w.rootNid = root.nid
+}
+
+// mayInline reports whether a regular file's payload may be tail-packed into
+// its inode. A shared source has to stay out of line so the sharing inodes can
+// reference its extent, and WithInlineThreshold lets the caller cap tail
+// packing so it decides which files get their own extent.
+func (w *erofsWriter) mayInline(e *erofsEntry) bool {
+	if e.isShareSrc {
+		return false
+	}
+	switch {
+	case w.inlineThreshold == 0:
+		return true
+	case w.inlineThreshold < 0:
+		return false
+	default:
+		return e.size < uint64(w.inlineThreshold)
+	}
 }
 
 // chunkIndexPad returns the padding inserted between an inode's xattr area and
