@@ -849,9 +849,9 @@ type erofsEntry struct {
 
 	// For regular files — metadata-only mode
 	chunks       []builder.Chunk
-	contiguous   bool  // data blocks are contiguous; use large chunk size
-	chunkBits    uint8 // per-entry chunk bits (0 = use global)
-	metadataOnly bool  // chunk-based layout even without chunks
+	contiguous   bool // data blocks are contiguous; use large chunk size
+	chunkBits    int8 // per-entry chunk bits override, -1 = unset (use writer default); valid range 0-31
+	metadataOnly bool // chunk-based layout even without chunks
 
 	// For regular files — full-image mode
 	data io.Reader
@@ -1313,6 +1313,7 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 		symTarget:     e.linkTarget,
 		chunks:        e.chunks,
 		contiguous:    e.contiguous,
+		chunkBits:     -1, // unset; planLayout assigns the actual value
 		metadataOnly:  e.metadataOnly,
 		data:          data,
 		xattrs:        e.xattrs,
