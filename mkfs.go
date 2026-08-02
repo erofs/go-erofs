@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"math/bits"
 	"os"
 	"path"
@@ -20,6 +21,10 @@ import (
 // Writer is a writable filesystem that produces an EROFS image on Close.
 // Files are added via Create, Mkdir, Symlink, and Mknod, then finalized
 // by calling Close which serializes the complete EROFS image.
+//
+// A Writer built with NewWriter has no output attached and is finalized with
+// Prepare and WriteTo instead, which emit a metadata-first image and need no
+// seeking.
 type Writer struct {
 	out          io.WriteSeeker
 	closed       bool
@@ -27,6 +32,7 @@ type Writer struct {
 	buildTime    uint64 // from WithBuildTime or buildTimer
 	buildTimeNs  uint32
 	hasBuildTime bool
+	uuid         [16]uint8           // from WithUUID; all-zero by default
 	wErr         error               // sticky error: once set, all subsequent ops return it
 	root         *fsEntry            // root directory
 	byPath       map[string]*fsEntry // path → entry (all types)
@@ -37,6 +43,13 @@ type Writer struct {
 	copyMetadataOnly bool   // metadata-only for current CopyFrom
 	copyMerge        bool   // merge mode: apply whiteouts
 	copyDeviceID     uint16 // device ID assigned to current MetadataOnly CopyFrom
+
+	inlineThreshold  int                                                             // from WithInlineThreshold
+	syntheticDirMeta func(string, SyntheticDirMetadata) (SyntheticDirMetadata, bool) // from WithSyntheticDirMetadata
+
+	// Set by Prepare; WriteTo emits exactly this layout.
+	layout *Layout
+	ew     *erofsWriter
 
 	dataFile *os.File // external data file (nil = spool mode)
 	dataOff  int64    // current byte offset in data file
@@ -68,6 +81,31 @@ type CopyOpt func(*Writer)
 // Create returns a Writer that produces an EROFS image on Close.
 // Options configure build time, data file, and temp directory.
 func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
+	fsys := newWriter(opts...)
+	fsys.out = out
+
+	if fsys.dataFile != nil {
+		// Reserve device slot 0 (DeviceID=1) for the data file.
+		// MetadataOnly CopyFrom device IDs will start at slot 1+.
+		// The reserved slot is filled in with the actual block count at Close.
+		fsys.devices = append(fsys.devices, 0)
+		off, err := fsys.dataFile.Seek(0, io.SeekEnd)
+		if err == nil {
+			fsys.dataOff = off
+		}
+	}
+
+	return fsys
+}
+
+// NewWriter returns a Writer with no attached output. It is finalized with
+// Prepare and WriteTo rather than Close, which produces a metadata-first image
+// and therefore requires no seekable destination.
+func NewWriter(opts ...CreateOpt) *Writer {
+	return newWriter(opts...)
+}
+
+func newWriter(opts ...CreateOpt) *Writer {
 	var o createOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -78,30 +116,21 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		mode: disk.StatTypeDir | 0o755,
 	}
 	fsys := &Writer{
-		out:          out,
-		buildTime:    o.buildTime,
-		buildTimeNs:  o.buildTimeNs,
-		hasBuildTime: o.hasBuildTime,
-		root:         root,
-		byPath:       map[string]*fsEntry{"/": root},
-		dataFile:     o.dataFile,
-		tempDir:      o.tempDir,
+		buildTime:        o.buildTime,
+		buildTimeNs:      o.buildTimeNs,
+		hasBuildTime:     o.hasBuildTime,
+		uuid:             o.uuid,
+		root:             root,
+		byPath:           map[string]*fsEntry{"/": root},
+		inlineThreshold:  o.inlineThreshold,
+		syntheticDirMeta: o.syntheticDirMeta,
+		dataFile:         o.dataFile,
+		tempDir:          o.tempDir,
 	}
 
 	if o.blockSize != 0 {
 		if err := fsys.setBlockSize(o.blockSize); err != nil {
 			fsys.wErr = err
-		}
-	}
-
-	if o.dataFile != nil {
-		// Reserve device slot 0 (DeviceID=1) for the data file.
-		// MetadataOnly CopyFrom device IDs will start at slot 1+.
-		// The reserved slot is filled in with the actual block count at Close.
-		fsys.devices = append(fsys.devices, 0)
-		off, err := o.dataFile.Seek(0, io.SeekEnd)
-		if err == nil {
-			fsys.dataOff = off
 		}
 	}
 
@@ -172,6 +201,63 @@ func WithTempDir(dir string) CreateOpt {
 	}
 }
 
+// WithUUID sets the filesystem UUID. The default is all zero, which is already
+// deterministic; set an explicit value to distinguish images that are otherwise
+// byte-identical.
+func WithUUID(uuid [16]byte) CreateOpt {
+	return func(o *createOptions) {
+		o.uuid = uuid
+	}
+}
+
+// WithInlineThreshold caps tail-packing of regular file payloads into their
+// inodes, so the caller decides which files get a data extent of their own
+// (and therefore appear in [Layout.Extents]).
+//
+// A file is tail-packed only if its size is below n and it still fits in the
+// remainder of the inode's block. n == 0 (the default) keeps the implicit
+// "whatever fits" rule; a negative n disables tail packing entirely. Directory
+// blocks and symlink targets are unaffected.
+func WithInlineThreshold(n int) CreateOpt {
+	return func(o *createOptions) {
+		o.inlineThreshold = n
+	}
+}
+
+// SyntheticDirMetadata are the attributes given to a directory the Writer has
+// to synthesize because an entry beneath it was added without an entry of its
+// own.
+type SyntheticDirMetadata struct {
+	// Mode is the permission bits; the directory type bit is added by the Writer.
+	Mode uint16
+	// UID and GID are the numeric owner ids.
+	UID, GID uint32
+	// Mtime and MtimeNs are the modification timestamp.
+	Mtime   uint64
+	MtimeNs uint32
+	// Xattrs are extended attributes, or nil.
+	Xattrs map[string]string
+}
+
+// WithSyntheticDirMetadata installs a hook consulted whenever the Writer has to
+// synthesize a missing parent directory, so the caller can give it meaningful
+// attributes instead of the default 0755 root:root.
+//
+// fn receives the image path of the directory to synthesize and the attributes
+// of the nearest ancestor directory already present in the image (the root's
+// attributes if there is no closer one), which is what mkfs.erofs inherits
+// from. Returning false falls back to the default attributes.
+//
+// A directory that is later described explicitly (by Mkdir or CopyFrom) has its
+// synthesized attributes replaced, so the hook only decides the attributes of
+// directories that are never described at all. [Writer.SyntheticDirs] reports
+// which those are.
+func WithSyntheticDirMetadata(fn func(path string, ancestor SyntheticDirMetadata) (SyntheticDirMetadata, bool)) CreateOpt {
+	return func(o *createOptions) {
+		o.syntheticDirMeta = fn
+	}
+}
+
 // --- Writer entry methods ---
 
 // Create creates a regular file with default mode 0644. The caller must
@@ -219,6 +305,11 @@ func (fsys *Writer) Create(name string) (*File, error) {
 // Mkdir creates a directory. Only permission bits from perm are used,
 // including setuid, setgid and sticky as os.Mkdir does; type bits are forced
 // to directory. Mkdir("/", perm) sets root permissions.
+//
+// A directory that already exists — including one the Writer synthesized to
+// hold an entry added earlier — has its permissions updated in place and is no
+// longer reported by [Writer.SyntheticDirs]. Any other existing entry at name
+// is an error.
 func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
 	if fsys.wErr != nil {
 		return fsys.wErr
@@ -227,6 +318,17 @@ func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
 	name = cleanPath(name)
 	if name == "/" {
 		fsys.root.mode = dirMode
+		return nil
+	}
+	if existing, ok := fsys.byPath[name]; ok {
+		if err := fsys.checkMutable(); err != nil {
+			return err
+		}
+		if existing.mode&disk.StatTypeMask != disk.StatTypeDir {
+			return fmt.Errorf("mkfs: %q already exists and is not a directory", name)
+		}
+		existing.mode = disk.StatTypeDir | uint16(perm.Perm())
+		existing.synthesized = false
 		return nil
 	}
 	if err := fsys.checkPath(name); err != nil {
@@ -369,6 +471,200 @@ func (fsys *Writer) SetNlink(name string, nlink uint32) error {
 	}
 	e.nlink = nlink
 	e.nlinkSet = true
+	return nil
+}
+
+// SetToken attaches an opaque value to the named entry. If the entry ends up
+// with an out-of-line payload, the value is reported as [Extent.Token] on the
+// corresponding entry of the layout returned by [Writer.Prepare], which lets a
+// caller recover per-entry context (for example a precomputed content digest)
+// without matching on paths.
+func (fsys *Writer) SetToken(name string, tok any) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	e, err := fsys.lookup(name)
+	if err != nil {
+		return err
+	}
+	e.token = tok
+	return nil
+}
+
+// Link creates newname as a hardlink to oldname: a second directory entry
+// resolving to the same inode, with the inode's link count incremented.
+// Metadata is necessarily shared. Directories cannot be hardlinked.
+func (fsys *Writer) Link(oldname, newname string) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	if err := fsys.checkMutable(); err != nil {
+		return err
+	}
+	target, err := fsys.lookup(oldname)
+	if err != nil {
+		return err
+	}
+	target = resolveHardlink(target)
+	if target.mode&disk.StatTypeMask == disk.StatTypeDir {
+		return fmt.Errorf("mkfs: cannot hardlink directory %q", oldname)
+	}
+	newname = cleanPath(newname)
+	if newname == "/" {
+		return fmt.Errorf("mkfs: cannot create hardlink at root")
+	}
+	if err := fsys.checkPath(newname); err != nil {
+		return err
+	}
+
+	fsys.ensureParent(newname)
+
+	e := &fsEntry{
+		path:       newname,
+		mode:       target.mode,
+		size:       target.size,
+		hardlinkTo: target,
+		fileClosed: true,
+	}
+	fsys.addChild(e)
+	target.extraLinks++
+	return nil
+}
+
+// ShareData makes dst's inode reference the same data extent as src, so the
+// payload is stored once. Both inodes keep independent metadata; dst's size is
+// set to src's. src must be a regular file with a payload; a shared payload is
+// never tail-packed into an inode, and appears exactly once in
+// [Layout.Extents].
+func (fsys *Writer) ShareData(src, dst string) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	if err := fsys.checkMutable(); err != nil {
+		return err
+	}
+	s, err := fsys.lookup(src)
+	if err != nil {
+		return err
+	}
+	d, err := fsys.lookup(dst)
+	if err != nil {
+		return err
+	}
+	s, d = resolveHardlink(s), resolveHardlink(d)
+	for s.shareSrc != nil {
+		s = s.shareSrc
+	}
+	if s == d {
+		return fmt.Errorf("mkfs: cannot share %q with itself", dst)
+	}
+	if s.mode&disk.StatTypeMask != disk.StatTypeReg || d.mode&disk.StatTypeMask != disk.StatTypeReg {
+		return fmt.Errorf("mkfs: can only share data between regular files (%q, %q)", src, dst)
+	}
+	if s.size == 0 {
+		return fmt.Errorf("mkfs: cannot share data of empty file %q", src)
+	}
+	if len(s.chunks) > 0 || s.metadataOnly {
+		return fmt.Errorf("mkfs: cannot share data of chunk-based file %q", src)
+	}
+	s.shareRefs++
+	d.shareSrc = s
+	d.size = s.size
+	d.directData = nil
+	d.chunks = nil
+	d.fileClosed = true
+	return nil
+}
+
+// Remove deletes the entry at name, and for a directory its whole subtree, from
+// the pending image. It is the primitive behind last-writer-wins semantics: a
+// caller that has to replace an entry removes it first.
+//
+// Removing an entry that a hardlink or a shared payload still points at is an
+// error, because that would leave a dangling reference.
+func (fsys *Writer) Remove(name string) error {
+	if fsys.wErr != nil {
+		return fsys.wErr
+	}
+	if err := fsys.checkMutable(); err != nil {
+		return err
+	}
+	name = cleanPath(name)
+	if name == "/" {
+		return fmt.Errorf("mkfs: cannot remove root")
+	}
+	e, ok := fsys.byPath[name]
+	if !ok {
+		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
+	}
+	if err := checkUnreferenced(e); err != nil {
+		return err
+	}
+	if e.mode&disk.StatTypeMask == disk.StatTypeDir {
+		for _, c := range e.children {
+			if c.removed {
+				continue
+			}
+			if err := checkUnreferenced(c); err != nil {
+				return err
+			}
+		}
+	}
+	if e.hardlinkTo != nil {
+		e.hardlinkTo.extraLinks--
+	}
+	if e.shareSrc != nil {
+		e.shareSrc.shareRefs--
+	}
+	fsys.remove(name)
+	return nil
+}
+
+// SyntheticDirs returns the sorted image paths of directories the Writer
+// synthesized because an entry beneath them was added without an entry of their
+// own, and which were never described explicitly afterwards. A caller that
+// cares about lower-layer directory attributes (an EROFS image is a filesystem,
+// not a changeset, so the dirent tree has to be complete) can use this to warn
+// or fail.
+func (fsys *Writer) SyntheticDirs() []string {
+	var paths []string
+	for p, e := range fsys.byPath {
+		if e.synthesized && !e.removed {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// checkMutable reports an error if the tree can no longer be changed.
+func (fsys *Writer) checkMutable() error {
+	if fsys.closed {
+		return fmt.Errorf("mkfs: FS is closed")
+	}
+	if fsys.layout != nil {
+		return fmt.Errorf("mkfs: layout already prepared")
+	}
+	return nil
+}
+
+// resolveHardlink follows a chain of hardlinks to the inode they name.
+func resolveHardlink(e *fsEntry) *fsEntry {
+	for e.hardlinkTo != nil {
+		e = e.hardlinkTo
+	}
+	return e
+}
+
+// checkUnreferenced reports an error if removing e would dangle a hardlink or a
+// shared payload.
+func checkUnreferenced(e *fsEntry) error {
+	if e.extraLinks > 0 {
+		return fmt.Errorf("mkfs: %q still has %d hardlink(s) to it", e.path, e.extraLinks)
+	}
+	if e.shareRefs > 0 {
+		return fmt.Errorf("mkfs: %q payload is still shared by %d entr(ies)", e.path, e.shareRefs)
+	}
 	return nil
 }
 
@@ -585,12 +881,38 @@ func (fsys *Writer) Close() error {
 	if fsys.closed {
 		return fmt.Errorf("mkfs: FS already closed")
 	}
+	if fsys.out == nil {
+		return fmt.Errorf("mkfs: no output attached; finalize with WriteTo")
+	}
+	if fsys.layout != nil {
+		return fmt.Errorf("mkfs: layout already prepared; finalize with WriteTo")
+	}
 	fsys.closed = true
 
 	if fsys.spool != nil {
 		defer func() { _ = fsys.spool.Close() }()
 	}
 
+	ew, err := fsys.finalizeTree()
+	if err != nil {
+		return err
+	}
+
+	// Data-first layout: sbArea, data blocks, metadata. The sentinel makes
+	// assignDataBlocks place data before metadata.
+	ew.metaBlkAddr = 0xFFFFFFFF
+	ew.assignDataBlocks()
+	if err := ew.resolveSharedData(); err != nil {
+		return err
+	}
+
+	return ew.write(fsys.out)
+}
+
+// finalizeTree resolves the block size, converts the fsEntry tree into the
+// erofsEntry tree and plans the metadata area. The caller decides where data
+// blocks go by setting erofsWriter.metaBlkAddr and calling assignDataBlocks.
+func (fsys *Writer) finalizeTree() (*erofsWriter, error) {
 	fsys.resolveBlockSize()
 
 	if fsys.dataFile != nil {
@@ -605,7 +927,10 @@ func (fsys *Writer) Close() error {
 	}
 
 	// Build erofsEntry tree from the fsEntry tree via BFS.
-	root := fsys.buildErofsTree()
+	root, err := fsys.buildErofsTree()
+	if err != nil {
+		return nil, err
+	}
 
 	var chunkBits uint8
 	for cs := fsys.blockSize; cs < 4096; cs <<= 1 {
@@ -613,18 +938,19 @@ func (fsys *Writer) Close() error {
 	}
 
 	ew := &erofsWriter{
-		buildTime:   buildTime,
-		buildTimeNs: fsys.buildTimeNs,
-		devices:     fsys.devices,
-		blockSize:   fsys.blockSize,
-		chunkBits:   chunkBits,
-		zeroBuf:     make([]byte, fsys.blockSize),
+		buildTime:       buildTime,
+		buildTimeNs:     fsys.buildTimeNs,
+		uuid:            fsys.uuid,
+		devices:         fsys.devices,
+		blockSize:       fsys.blockSize,
+		chunkBits:       chunkBits,
+		inlineThreshold: fsys.inlineThreshold,
+		zeroBuf:         make([]byte, fsys.blockSize),
 	}
 
 	ew.planLayout(root)
 	fixParentNids(root, root)
-
-	return ew.write(fsys.out)
+	return ew, nil
 }
 
 // Stat returns file info for the named path. The name is cleaned the same
@@ -646,6 +972,11 @@ func (fsys *Writer) Open(name string) (fs.File, error) {
 	e, ok := fsys.byPath[name]
 	if !ok {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	// A hardlink reads through to the inode it names.
+	e = resolveHardlink(e)
+	if e.shareSrc != nil {
+		e = e.shareSrc
 	}
 
 	typ := e.mode & disk.StatTypeMask
@@ -764,10 +1095,20 @@ type fsEntry struct {
 	linkTarget string
 	chunks     []builder.Chunk
 	contiguous bool // data blocks are contiguous; flat-plain is sufficient
+	token      any  // from SetToken; surfaced as Extent.Token
 
 	// Tree structure — maintained during add/remove.
 	parent   *fsEntry
 	children []*fsEntry
+
+	// hardlinkTo, when set, marks this entry as an additional dirent for
+	// another inode (see Link). It gets no inode of its own.
+	hardlinkTo *fsEntry
+	extraLinks uint32 // number of hardlinks pointing at this entry
+	// shareSrc, when set, makes this inode reference another's data extent
+	// (see ShareData).
+	shareSrc  *fsEntry
+	shareRefs uint32 // number of entries sharing this entry's payload
 
 	// data location in spool file
 	spoolOff     int64
@@ -777,16 +1118,20 @@ type fsEntry struct {
 
 	removed      bool // true if removed by a whiteout in a merge layer
 	metadataOnly bool // from a metadata-only CopyFrom; use chunk-based layout
+	synthesized  bool // created by ensureParent, never described explicitly
 }
 
 // createOptions holds the parsed option values for Create.
 type createOptions struct {
-	buildTime    uint64
-	buildTimeNs  uint32
-	hasBuildTime bool
-	blockSize    int      // 0 = use default
-	dataFile     *os.File // external data file for metadata-only mode
-	tempDir      string   // temp directory for spool file
+	buildTime        uint64
+	buildTimeNs      uint32
+	hasBuildTime     bool
+	uuid             [16]uint8
+	blockSize        int      // 0 = use default
+	dataFile         *os.File // external data file for metadata-only mode
+	tempDir          string   // temp directory for spool file
+	inlineThreshold  int      // see WithInlineThreshold
+	syntheticDirMeta func(string, SyntheticDirMetadata) (SyntheticDirMetadata, bool)
 }
 
 // blockSizer may be implemented by an fs.FS to declare its block size.
@@ -859,6 +1204,17 @@ type erofsEntry struct {
 	// Extended attributes
 	xattrs map[string]string
 
+	// hardlinkTo, when set, marks this entry as an extra dirent for another
+	// inode: it gets no inode (and no NID) of its own.
+	hardlinkTo *erofsEntry
+	// shareSrc, when set, makes this inode reference another's data extent.
+	shareSrc *erofsEntry
+	// isShareSrc marks an entry whose payload other inodes reference, which
+	// keeps it out of line.
+	isShareSrc bool
+	// token is the caller value from Writer.SetToken.
+	token any
+
 	// EROFS layout (assigned during planning)
 	nid           uint64
 	parentNid     uint64
@@ -871,6 +1227,15 @@ type erofsEntry struct {
 
 	// Data block address for flat-plain files (full-image mode)
 	dataBlkAddr uint32
+}
+
+// direntTarget returns the inode an entry's dirent resolves to: itself, or the
+// hardlink target when the entry is an extra dirent for another inode.
+func direntTarget(e *erofsEntry) *erofsEntry {
+	if e.hardlinkTo != nil {
+		return e.hardlinkTo
+	}
+	return e
 }
 
 // --- Internal helpers ---
@@ -1084,12 +1449,17 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 
 	// Handle duplicate paths (overwrite semantics).
 	if existing, ok := fsys.byPath[p]; ok {
-		// Preserve tree linkage when overwriting.
+		// Preserve tree linkage, and the counts of references other entries
+		// hold on this one, when overwriting.
 		savedParent := existing.parent
 		savedChildren := existing.children
+		savedExtraLinks := existing.extraLinks
+		savedShareRefs := existing.shareRefs
 		*existing = *fe
 		existing.parent = savedParent
 		existing.children = savedChildren
+		existing.extraLinks = savedExtraLinks
+		existing.shareRefs = savedShareRefs
 		fe = existing
 	} else {
 		fsys.addChild(fe)
@@ -1143,8 +1513,8 @@ func (fsys *Writer) add(p string, info fs.FileInfo) error {
 
 // checkPath validates that a path hasn't already been registered.
 func (fsys *Writer) checkPath(name string) error {
-	if fsys.closed {
-		return fmt.Errorf("mkfs: FS is closed")
+	if err := fsys.checkMutable(); err != nil {
+		return err
 	}
 	if _, ok := fsys.byPath[name]; ok {
 		return fmt.Errorf("mkfs: duplicate path %q", name)
@@ -1160,8 +1530,10 @@ func (fsys *Writer) ensureParent(name string) {
 	}
 	// Walk up to find existing ancestors.
 	var missing []string
+	ancestor := fsys.root
 	for d := dir; d != "/"; d = path.Dir(d) {
-		if _, ok := fsys.byPath[d]; ok {
+		if e, ok := fsys.byPath[d]; ok {
+			ancestor = e
 			break
 		}
 		missing = append(missing, d)
@@ -1170,10 +1542,35 @@ func (fsys *Writer) ensureParent(name string) {
 	for i := len(missing) - 1; i >= 0; i-- {
 		d := missing[i]
 		e := &fsEntry{
-			path: d,
-			mode: disk.StatTypeDir | 0o755,
+			path:        d,
+			mode:        disk.StatTypeDir | 0o755,
+			synthesized: true,
+		}
+		if fsys.syntheticDirMeta != nil {
+			if meta, ok := fsys.syntheticDirMeta(d, ancestorMetadata(ancestor)); ok {
+				e.mode = disk.StatTypeDir | (meta.Mode & 0o7777)
+				e.uid = meta.UID
+				e.gid = meta.GID
+				e.mtime = meta.Mtime
+				e.mtimeNs = meta.MtimeNs
+				e.xattrs = maps.Clone(meta.Xattrs)
+			}
 		}
 		fsys.addChild(e)
+		ancestor = e
+	}
+}
+
+// ancestorMetadata describes an existing directory for the synthetic-directory
+// hook, mirroring what mkfs.erofs inherits from the nearest ancestor.
+func ancestorMetadata(e *fsEntry) SyntheticDirMetadata {
+	return SyntheticDirMetadata{
+		Mode:    e.mode & 0o7777,
+		UID:     e.uid,
+		GID:     e.gid,
+		Mtime:   e.mtime,
+		MtimeNs: e.mtimeNs,
+		Xattrs:  e.xattrs,
 	}
 }
 
@@ -1230,13 +1627,17 @@ func (fsys *Writer) removeSubtree(e *fsEntry) {
 
 // buildErofsTree converts the fsEntry tree into an erofsEntry tree via BFS.
 // Children are sorted for deterministic output. The Writer is consumed.
-func (fsys *Writer) buildErofsTree() *erofsEntry {
+func (fsys *Writer) buildErofsTree() (*erofsEntry, error) {
 	type pair struct {
 		fs *fsEntry
 		er *erofsEntry
 	}
 
+	// Hardlinks and shared payloads point at other entries, which BFS may not
+	// have converted yet, so the pointers are wired up in a second pass.
+	converted := make(map[*fsEntry]*erofsEntry, len(fsys.byPath))
 	rootEr := fsys.fsToErofs(fsys.root)
+	converted[fsys.root] = rootEr
 	queue := []pair{{fsys.root, rootEr}}
 
 	for len(queue) > 0 {
@@ -1263,6 +1664,7 @@ func (fsys *Writer) buildErofsTree() *erofsEntry {
 				continue
 			}
 			ent := fsys.fsToErofs(c)
+			converted[c] = ent
 			cur.er.children = append(cur.er.children, ent)
 			if c.mode&disk.StatTypeMask == disk.StatTypeDir {
 				queue = append(queue, pair{c, ent})
@@ -1274,7 +1676,25 @@ func (fsys *Writer) buildErofsTree() *erofsEntry {
 			return cur.er.children[i].name < cur.er.children[j].name
 		})
 	}
-	return rootEr
+
+	for fe, ee := range converted {
+		if fe.hardlinkTo != nil {
+			target, ok := converted[fe.hardlinkTo]
+			if !ok {
+				return nil, fmt.Errorf("mkfs: hardlink %q points at removed entry %q", fe.path, fe.hardlinkTo.path)
+			}
+			ee.hardlinkTo = target
+		}
+		if fe.shareSrc != nil {
+			src, ok := converted[fe.shareSrc]
+			if !ok {
+				return nil, fmt.Errorf("mkfs: %q shares data with removed entry %q", fe.path, fe.shareSrc.path)
+			}
+			ee.shareSrc = src
+			src.isShareSrc = true
+		}
+	}
+	return rootEr, nil
 }
 
 // fsToErofs converts a single fsEntry to an erofsEntry, resolving data readers.
@@ -1286,11 +1706,12 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 	case e.mode&disk.StatTypeMask == disk.StatTypeDir:
 		nlink = 2 // adjusted by buildErofsTree
 	default:
-		nlink = 1
+		nlink = 1 + e.extraLinks
 	}
 
 	var data io.Reader
 	if fsys.dataFile == nil && len(e.chunks) == 0 && !e.metadataOnly &&
+		e.hardlinkTo == nil && e.shareSrc == nil &&
 		e.mode&disk.StatTypeMask == disk.StatTypeReg && e.size > 0 {
 		if e.directData != nil {
 			data = e.directData
@@ -1316,6 +1737,7 @@ func (fsys *Writer) fsToErofs(e *fsEntry) *erofsEntry {
 		metadataOnly:  e.metadataOnly,
 		data:          data,
 		xattrs:        e.xattrs,
+		token:         e.token,
 		erofsFileType: modeToFileType(e.mode),
 	}
 }

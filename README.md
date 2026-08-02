@@ -80,3 +80,40 @@ w.Symlink("hello.txt", "/link")
 w.Close()
 outFile.Close()
 ```
+
+`Create` needs a seekable destination: it lays the image out data-first and seeks
+back to fill in the superblock.
+
+## Streaming an image, with the layout known up front
+
+`NewWriter` builds the same tree but lays it out metadata-first, so the image can
+be written to a plain `io.Writer` — a pipe, a compressor, a hash. `Prepare`
+returns the layout before a single byte is emitted, which lets a caller
+pre-compute digests, plan a chunk index, or route each out-of-line payload
+somewhere of its own.
+
+```go
+w := erofs.NewWriter(erofs.WithBuildTime(0, 0))
+
+f, _ := w.Create("/bin/tool")
+io.Copy(f, payload)
+f.Close()
+w.SetToken("/bin/tool", payloadDigest) // recovered from the layout below
+
+layout, _ := w.Prepare()
+for _, e := range layout.Extents {
+    if e.Kind == erofs.ExtentFileData {
+        // [e.Offset, e.Offset+e.Size) is this file's bytes verbatim,
+        // followed by e.Pad zero bytes.
+        fmt.Println(e.Path, e.Offset, e.Size, e.Token)
+    }
+}
+
+w.WriteTo(dst) // emits exactly layout.ImageSize bytes, in ascending order
+```
+
+`Link` adds a second dirent for an existing inode, and `ShareData` gives two
+inodes with independent metadata one shared payload — so duplicate content can be
+stored once. `WithInlineThreshold` caps tail-packing, which decides what gets an
+extent of its own; `WithSyntheticDirMetadata` and `SyntheticDirs` deal with the
+directories a filesystem image needs but a layer changeset may not mention.
