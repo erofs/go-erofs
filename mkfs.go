@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1333,8 +1334,7 @@ func (fsys *Writer) ensureParent(name string) error {
 		missing = append(missing, d)
 	}
 	// Create in top-down order.
-	for i := len(missing) - 1; i >= 0; i-- {
-		d := missing[i]
+	for _, d := range slices.Backward(missing) {
 		e := &fsEntry{
 			path: d,
 			mode: disk.StatTypeDir | 0o755,
@@ -1626,10 +1626,7 @@ func (fsys *Writer) chunksFromRanges(ranges []DataRange, fileSize int64) ([]buil
 			// Hole: emit NullPhysicalBlock chunks covering the hole span.
 			totalBlocks := (uint64(r.Size) + blockSize - 1) / blockSize
 			for totalBlocks > 0 {
-				count := totalBlocks
-				if count > 65535 {
-					count = 65535
-				}
+				count := min(totalBlocks, 65535)
 				chunks = append(chunks, builder.Chunk{
 					PhysicalBlock: builder.NullPhysicalBlock,
 					Count:         uint16(count),
@@ -1654,10 +1651,7 @@ func (fsys *Writer) chunksFromRanges(ranges []DataRange, fileSize int64) ([]buil
 		startBlock := uint64(r.Offset) / blockSize
 		totalBlocks := (uint64(r.Size) + blockSize - 1) / blockSize
 		for totalBlocks > 0 {
-			count := totalBlocks
-			if count > 65535 {
-				count = 65535
-			}
+			count := min(totalBlocks, 65535)
 			chunks = append(chunks, builder.Chunk{
 				PhysicalBlock: startBlock,
 				Count:         uint16(count),
@@ -1721,10 +1715,7 @@ func (f *File) closeDataFile() error {
 	totalBlocks := (uint64(f.written) + uint64(f.fs.resolveBlockSize()) - 1) / uint64(f.fs.resolveBlockSize())
 
 	for totalBlocks > 0 {
-		count := totalBlocks
-		if count > 65535 {
-			count = 65535
-		}
+		count := min(totalBlocks, 65535)
 		f.entry.chunks = append(f.entry.chunks, builder.Chunk{
 			PhysicalBlock: startBlock,
 			Count:         uint16(count),
@@ -1746,7 +1737,7 @@ const (
 	// maxPathLen matches Linux PATH_MAX. Nothing deeper is usable, and the
 	// bound is what makes a walk over a cyclic source terminate.
 	maxPathLen = 4096
-	nullAddr         = 0xFFFFFFFF // marks a hole/sparse chunk
+	nullAddr   = 0xFFFFFFFF // marks a hole/sparse chunk
 
 	// Overlay whiteout markers (AUFS convention used by OCI layers).
 	whiteoutPrefix = ".wh."

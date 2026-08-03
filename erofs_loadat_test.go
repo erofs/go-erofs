@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -141,7 +142,7 @@ func TestReadReferenceImage(t *testing.T) {
 			}
 
 			for _, want := range []string{".", "a.txt", "dir", "dir/b.txt", "link"} {
-				if !contains(seen, want) {
+				if !slices.Contains(seen, want) {
 					t.Errorf("%q missing from walk; saw %v", want, seen)
 				}
 			}
@@ -166,14 +167,4 @@ func TestReadReferenceImage(t *testing.T) {
 			}
 		})
 	}
-}
-
-func contains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-
-	return false
 }

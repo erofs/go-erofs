@@ -20,6 +20,7 @@ import (
 	"archive/tar"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"time"
 )
@@ -146,7 +147,7 @@ func (ti tarInfo) ModTime() time.Time {
 func (ti tarInfo) IsDir() bool {
 	return (ti.mode & os.ModeDir) != 0
 }
-func (ti tarInfo) Sys() interface{} {
+func (ti tarInfo) Sys() any {
 	return ti.hdr
 }
 
@@ -172,9 +173,7 @@ func (tc TarContext) WithXattrs(xattrs map[string]string) TarContext {
 	if ntc.Xattrs == nil {
 		ntc.Xattrs = map[string]string{}
 	}
-	for k, v := range xattrs {
-		ntc.Xattrs[k] = v
-	}
+	maps.Copy(ntc.Xattrs, xattrs)
 	return ntc
 }
 
@@ -197,10 +196,7 @@ func (tc TarContext) SparseFile(name string, size int64, data []byte, dataOffset
 		zeros := make([]byte, 64*1024)
 		written := int64(0)
 		for written < size {
-			chunk := size - written
-			if chunk > int64(len(zeros)) {
-				chunk = int64(len(zeros))
-			}
+			chunk := min(size-written, int64(len(zeros)))
 			buf := zeros[:chunk]
 			// Overlay data at the correct offset.
 			if data != nil && written+chunk > dataOffset && written < dataOffset+int64(len(data)) {

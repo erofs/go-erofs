@@ -1913,10 +1913,7 @@ func (f *dataRangerFile) Read(p []byte) (int, error) {
 		n = copy(p, f.info.content[f.offset:])
 	} else {
 		// No content supplied: return zeros up to size.
-		end := f.info.size - f.offset
-		if int64(len(p)) < end {
-			end = int64(len(p))
-		}
+		end := min(int64(len(p)), f.info.size-f.offset)
 		for i := range p[:end] {
 			p[i] = 0
 		}

@@ -1462,7 +1462,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 			return ents, fmt.Errorf("invalid dirent name offset %d (buf size %d): %w", dirents[0].NameOff, bufLen, ErrInvalid)
 		}
 
-		for i := uint16(0); i < entryN; i++ {
+		for i := range entryN {
 			var name string
 			if i < entryN-1 {
 				start := int(disk.SizeDirent) * (int(i) + 1)

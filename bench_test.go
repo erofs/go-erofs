@@ -664,7 +664,7 @@ func BenchmarkMerge10Layer(b *testing.B) {
 					sz := 500 + (i*251)%(4*1024)
 					writeFile(fmt.Sprintf("/usr/include/linux/header_%04d.h", i), sz)
 				}
-				for i := 0; i < 50; i++ {
+				for i := range 50 {
 					sz := 5*1024 + (i*3571)%(45*1024)
 					writeFile(fmt.Sprintf("/usr/share/locale/en/messages_%04d.mo", i), sz)
 					writeFile(fmt.Sprintf("/usr/share/locale/de/messages_%04d.mo", i), sz)
@@ -685,24 +685,24 @@ func BenchmarkMerge10Layer(b *testing.B) {
 				}
 
 				// ~50 security/PAM modules (10-100 KB)
-				for i := 0; i < 50; i++ {
+				for i := range 50 {
 					sz := 10*1024 + (i*1009)%(90*1024)
 					writeFile(fmt.Sprintf("/lib/x86_64-linux-gnu/security/pam_%04d.so", i), sz)
 				}
 
 				// ~100 timezone files (200 bytes - 2 KB)
-				for i := 0; i < 50; i++ {
+				for i := range 50 {
 					sz := 200 + (i*127)%1800
 					writeFile(fmt.Sprintf("/usr/share/zoneinfo/US/zone_%04d", i), sz)
 					writeFile(fmt.Sprintf("/usr/share/zoneinfo/Europe/zone_%04d", i), sz)
 				}
 
 				// Additional small files to ensure 5000+ total.
-				for i := 0; i < 500; i++ {
+				for i := range 500 {
 					sz := 64 + (i*37)%400
 					writeFile(fmt.Sprintf("/var/lib/apt/lists/pkg_%04d", i), sz)
 				}
-				for i := 0; i < 300; i++ {
+				for i := range 300 {
 					sz := 100 + (i*53)%600
 					writeFile(fmt.Sprintf("/etc/cron.d/job_%04d", i), sz)
 				}

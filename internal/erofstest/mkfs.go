@@ -72,7 +72,7 @@ func mkfsVersion() (string, error) {
 		return "", fmt.Errorf("mkfs.erofs -V failed: %s: %w", out, err)
 	}
 	// Output format: "mkfs.erofs (erofs-utils) 1.9.1\n..."
-	line := strings.SplitN(string(out), "\n", 2)[0]
+	line, _, _ := strings.Cut(string(out), "\n")
 	fields := strings.Fields(line)
 	if len(fields) < 3 {
 		return "", fmt.Errorf("unexpected mkfs.erofs version output: %q", line)

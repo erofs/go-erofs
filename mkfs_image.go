@@ -436,10 +436,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 func (fsys *Writer) parseDirBlock(data []byte, dirSize, blockSize int, parentPath string, queue *[]imgQEntry) {
 	pos := 0
 	for pos < dirSize {
-		blockEnd := pos + blockSize
-		if blockEnd > dirSize {
-			blockEnd = dirSize
-		}
+		blockEnd := min(pos+blockSize, dirSize)
 		blk := data[pos:blockEnd]
 		if len(blk) < disk.SizeDirent {
 			break
@@ -451,7 +448,7 @@ func (fsys *Writer) parseDirBlock(data []byte, dirSize, blockSize int, parentPat
 			break
 		}
 
-		for i := 0; i < nEntries; i++ {
+		for i := range nEntries {
 			off := i * disk.SizeDirent
 			nid := binary.LittleEndian.Uint64(blk[off : off+8])
 			nameOff := int(binary.LittleEndian.Uint16(blk[off+8 : off+10]))

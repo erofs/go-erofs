@@ -2,6 +2,10 @@
 
 A Go library for reading and creating [EROFS](https://erofs.docs.kernel.org/) filesystem images using the standard [fs.FS](https://pkg.go.dev/io/fs#FS) interface.
 
+## About this fork
+
+TBD
+
 ## Features
 
 - **Read** EROFS images through Go's `fs.FS` interface

@@ -101,7 +101,7 @@ func TestUnmarshalMatchesBinaryDecode(t *testing.T) {
 				make([]byte, tc.size),
 				bytes.Repeat([]byte{0xFF}, tc.size),
 			}
-			for seed := int64(0); seed < 200; seed++ {
+			for seed := range int64(200) {
 				inputs = append(inputs, randBytes(t, tc.size, seed))
 			}
 

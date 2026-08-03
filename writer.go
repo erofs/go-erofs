@@ -575,7 +575,7 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 		var scratch [disk.SizeChunkIndex]byte
 		ci := 0   // index into source chunks
 		coff := 0 // block offset within current source chunk
-		for n := 0; n < nchunks; n++ {
+		for range nchunks {
 			if ci >= len(e.chunks) {
 				if _, err := buf.Write(nullIdx[:]); err != nil {
 					return err
@@ -604,7 +604,7 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 			}
 		}
 	} else {
-		for n := 0; n < nchunks; n++ {
+		for range nchunks {
 			if _, err := buf.Write(nullIdx[:]); err != nil {
 				return err
 			}
