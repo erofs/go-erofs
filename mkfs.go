@@ -1166,6 +1166,9 @@ func (de *dirEntry) Info() (fs.FileInfo, error) { return &writerFileInfo{entry: 
 // platform-specific stat types as a fallback for plain fs.FS sources.
 func (fsys *Writer) add(p string, info fs.FileInfo) error {
 	p = cleanPath(p)
+	if err := checkPathLen(p); err != nil {
+		return err
+	}
 	mode := goModeToUnixMode(info.Mode())
 	size := uint64(info.Size())
 	typ := mode & disk.StatTypeMask
@@ -1277,9 +1280,29 @@ func (fsys *Writer) checkPath(name string) error {
 	if fsys.closed {
 		return fmt.Errorf("mkfs: FS is closed")
 	}
+	if err := checkPathLen(name); err != nil {
+		return err
+	}
 	if _, ok := fsys.byPath[name]; ok {
 		return fmt.Errorf("mkfs: duplicate path %q", name)
 	}
+	return nil
+}
+
+// checkPathLen rejects paths longer than any system can use.
+//
+// Besides being meaningless, an unbounded path is how a non-terminating walk
+// shows up here: a source whose directory graph is not a tree — an EROFS
+// image with a directory reachable from itself, say — yields ever-deeper
+// paths, and CopyFrom walks it through fs.WalkDir, which has no cycle
+// detection for any fs.FS. Refusing the path stops the walk with an error
+// instead of letting it run until memory is gone.
+func checkPathLen(name string) error {
+	if len(name) > maxPathLen {
+		return fmt.Errorf("mkfs: path is %d bytes, over the %d byte limit (a source whose directories form a cycle looks like this): %w",
+			len(name), maxPathLen, ErrInvalid)
+	}
+
 	return nil
 }
 
@@ -1719,6 +1742,10 @@ func (f *File) closeDataFile() error {
 const (
 	minBlockSize     = 512
 	defaultBlockSize = 4096
+
+	// maxPathLen matches Linux PATH_MAX. Nothing deeper is usable, and the
+	// bound is what makes a walk over a cyclic source terminate.
+	maxPathLen = 4096
 	nullAddr         = 0xFFFFFFFF // marks a hole/sparse chunk
 
 	// Overlay whiteout markers (AUFS convention used by OCI layers).

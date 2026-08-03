@@ -3,6 +3,7 @@ package erofs_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	erofs "github.com/forkcloser/erofs"
 	"github.com/forkcloser/erofs/internal/erofstest"
@@ -956,5 +958,131 @@ func FuzzImageCorruptInode(f *testing.F) {
 			return
 		}
 		exerciseFS(fsys)
+	})
+}
+
+// exerciseCopyFrom drives the copyFromImage fast path, the second parser of
+// the same on-disk bytes. Failures are expected on corrupt input; the point
+// is that it terminates, does not panic, and does not allocate without bound.
+func exerciseCopyFrom(fsys fs.FS) {
+	defer func() { _ = recover() }()
+
+	// Only the MetadataOnly variants are fuzzed here: those are the ones that
+	// take the copyFromImage route this target exists to cover. Full-image
+	// CopyFrom walks the source through fs.WalkDir instead, which resolves
+	// every path from the root and so costs O(depth^2) on a deep chain — far
+	// too slow to fuzz. TestUntrustedDirectoryCycleFullImageTerminates covers
+	// that path deterministically.
+	for _, opts := range [][]erofs.CopyOpt{
+		{erofs.MetadataOnly()},
+		{erofs.MetadataOnly(), erofs.Merge()},
+	} {
+		w := erofs.Create(&erofstest.TestBuffer{})
+		if err := w.CopyFrom(fsys, opts...); err != nil {
+			continue
+		}
+		_ = w.Close()
+	}
+}
+
+// FuzzImageCopyFrom covers the gap the FuzzImage* targets leave: they all
+// drive exerciseFS, which only reads. CopyFrom(*image) takes an entirely
+// separate route through copyFromImage, parsing the same attacker-controlled
+// superblock, inodes, dirents, xattrs and chunk indexes with its own code.
+//
+// Superblock fields sized allocations directly there, and the dirent walk had
+// no visited set, so a handful of edited bytes could exhaust memory or spin
+// forever. Both are fixed; this keeps them fixed.
+func FuzzImageCopyFrom(f *testing.F) {
+	seed := buildMinimalImage(f)
+	f.Add(seed)
+
+	// Superblock offsets: Inos at 16, Blocks at 36, MetaBlkAddr at 40.
+	for _, tweak := range []struct {
+		off int
+		set func(b []byte, off int)
+	}{
+		{16, func(b []byte, off int) { binary.LittleEndian.PutUint64(b[off:], 1<<62) }},
+		{36, func(b []byte, off int) { binary.LittleEndian.PutUint32(b[off:], 0xFFFFFFFF) }},
+		{40, func(b []byte, off int) { binary.LittleEndian.PutUint32(b[off:], 0xFFFFFFFF) }},
+	} {
+		if len(seed) < 1024+128 {
+			break
+		}
+		m := make([]byte, len(seed))
+		copy(m, seed)
+		tweak.set(m, 1024+tweak.off)
+		f.Add(m)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		fsys, err := erofs.Open(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+		exerciseCopyFrom(fsys)
+	})
+}
+
+// FuzzWriterXattrLimits drives xattr names and values across the widths of
+// their on-disk fields: NameLen is a uint8 and ValueLen a uint16. Lengths
+// past those used to be truncated into the fields while the full bytes were
+// still written, producing images fsck.erofs rejects.
+func FuzzWriterXattrLimits(f *testing.F) {
+	f.Add("user.a", 1)
+	f.Add("user.a", 255)
+	f.Add("user.a", 65535)
+	f.Add("user.a", 65536)
+	f.Add("security.selinux", 4096)
+	f.Add("trusted."+strings.Repeat("n", 255), 8)
+	f.Add("trusted."+strings.Repeat("n", 256), 8)
+	f.Add(strings.Repeat("x", 300), 8)
+
+	f.Fuzz(func(t *testing.T, attr string, valueLen int) {
+		if valueLen < 0 || valueLen > 1<<20 || !utf8.ValidString(attr) {
+			return
+		}
+		if strings.ContainsAny(attr, "\x00") || attr == "" {
+			return
+		}
+
+		buf := &erofstest.TestBuffer{}
+		w := erofs.Create(buf, erofs.WithBuildTime(1000, 0))
+		if err := w.Mkdir("/d", 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		value := strings.Repeat("v", valueLen)
+		setErr := w.Setxattr("/d", attr, value)
+		closeErr := w.Close()
+
+		if setErr != nil {
+			// Rejected up front: nothing was written, so there is no image
+			// to check. Closing must not then claim success on a half-built
+			// image either way.
+			return
+		}
+		if closeErr != nil {
+			return
+		}
+
+		// Accepted: the image must be valid and the value must round-trip.
+		erofstest.FsckErofsBytes(t, buf.Bytes())
+
+		img, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("accepted xattr produced an unreadable image: %v", err)
+		}
+		fi, err := fs.Stat(img, "d")
+		if err != nil {
+			t.Fatalf("accepted xattr produced an unstattable dir: %v", err)
+		}
+		got, ok := fi.Sys().(*erofs.Stat).Xattrs[attr]
+		if !ok {
+			t.Fatalf("xattr %q accepted but missing after round-trip", attr)
+		}
+		if got != value {
+			t.Fatalf("xattr %q round-tripped %d bytes, wrote %d", attr, len(got), len(value))
+		}
 	})
 }

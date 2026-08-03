@@ -308,6 +308,49 @@ func TestUntrustedDirectoryCycleTerminates(t *testing.T) {
 	}
 }
 
+// TestUntrustedDirectoryCycleFullImageTerminates covers the same cyclic image
+// copied in full-image mode. That path does not use copyFromImage at all: it
+// walks the source through fs.WalkDir, which has no cycle detection, so the
+// visited set that bounds the metadata-only path does not help. What stops it
+// is the path length bound, since a cycle yields ever-deeper paths.
+func TestUntrustedDirectoryCycleFullImageTerminates(t *testing.T) {
+	buf := buildCyclicImage(t)
+
+	img, err := Open(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatalf("cyclic image failed to open: %v", err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	done := make(chan error, 1)
+	go func() {
+		dst := Create(&seekBuf{})
+		done <- dst.CopyFrom(img)
+	}()
+
+	select {
+	case err := <-done:
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Fatal("full-image CopyFrom accepted an image with a directory cycle")
+		}
+		// Cumulative allocation is high because resolving each path walks it
+		// from the root, so a deep chain costs O(depth^2) lookups. What has to
+		// stay bounded is resident memory, which is what an OOM is made of.
+		t.Logf("rejected with %v", err)
+		t.Logf("cumulative alloc %d bytes, heap in use after GC %d bytes",
+			after.TotalAlloc-before.TotalAlloc, after.HeapInuse)
+		if after.HeapInuse > 256<<20 {
+			t.Errorf("heap in use is %d bytes after a cyclic image; want well under 256 MiB", after.HeapInuse)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("full-image CopyFrom did not terminate on a cyclic image")
+	}
+}
+
 // TestReaderWalkOnCyclicImage records the reader's behaviour on the same
 // image. fs.WalkDir has no cycle detection of its own, so the walk is
 // expected to keep descending; the callback bounds it so this test can
