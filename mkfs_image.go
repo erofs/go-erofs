@@ -223,9 +223,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 
 		if compact {
 			var ino disk.InodeCompact
-			if _, err := binary.Decode(buf[:disk.SizeInodeCompact], binary.LittleEndian, &ino); err != nil {
-				return fmt.Errorf("decode compact inode %d: %w", cur.nid, err)
-			}
+			ino.Unmarshal(buf)
 			mode = ino.Mode
 			uid = uint32(ino.UID)
 			gid = uint32(ino.GID)
@@ -238,9 +236,7 @@ func (fsys *Writer) copyFromImage(img *image) error {
 			icSize = disk.SizeInodeCompact
 		} else {
 			var ino disk.InodeExtended
-			if _, err := binary.Decode(buf[:disk.SizeInodeExtended], binary.LittleEndian, &ino); err != nil {
-				return fmt.Errorf("decode extended inode %d: %w", cur.nid, err)
-			}
+			ino.Unmarshal(buf)
 			mode = ino.Mode
 			uid = ino.UID
 			gid = ino.GID
@@ -602,9 +598,7 @@ func parseXattrsFromBuf(buf []byte, at func(int64) []byte, sharedOff int64, long
 	}
 
 	var xh disk.XattrHeader
-	if _, err := binary.Decode(buf[:disk.SizeXattrBodyHeader], binary.LittleEndian, &xh); err != nil {
-		return nil
-	}
+	xh.Unmarshal(buf)
 	pos := disk.SizeXattrBodyHeader
 
 	xattrs := make(map[string]string)
@@ -622,9 +616,7 @@ func parseXattrsFromBuf(buf []byte, at func(int64) []byte, sharedOff int64, long
 			continue
 		}
 		var xe disk.XattrEntry
-		if _, err := binary.Decode(sharedBlock[:disk.SizeXattrEntry], binary.LittleEndian, &xe); err != nil {
-			continue
-		}
+		xe.Unmarshal(sharedBlock)
 		entryLen := int(xe.NameLen) + int(xe.ValueLen)
 		if disk.SizeXattrEntry+entryLen > len(sharedBlock) {
 			continue
@@ -638,9 +630,7 @@ func parseXattrsFromBuf(buf []byte, at func(int64) []byte, sharedOff int64, long
 	// Parse inline xattr entries.
 	for pos+disk.SizeXattrEntry <= len(buf) {
 		var xe disk.XattrEntry
-		if _, err := binary.Decode(buf[pos:pos+disk.SizeXattrEntry], binary.LittleEndian, &xe); err != nil {
-			break
-		}
+		xe.Unmarshal(buf[pos:])
 		pos += disk.SizeXattrEntry
 
 		entryLen := int(xe.NameLen) + int(xe.ValueLen)

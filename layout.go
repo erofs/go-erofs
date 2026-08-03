@@ -218,9 +218,25 @@ func direntNames(e *erofsEntry) []string {
 	return names
 }
 
-// direntDataSize calculates the serialized EROFS dirent data size for a directory.
-// For multi-block directories, this includes inter-block padding.
+// direntDataSize returns the serialized dirent data size for a directory,
+// computing it at most once per entry.
+//
+// Layout, trailing-size and inode serialization each need this value, and
+// several of them ask more than once. Recomputing means allocating and
+// sorting every name in the directory again, which is the single largest
+// cost of writing a wide tree. A directory always holds at least "." and
+// "..", so a zero cached value means "not computed yet".
 func (w *erofsWriter) direntDataSize(e *erofsEntry) int {
+	if e.direntSize == 0 {
+		e.direntSize = w.calcDirentDataSize(e)
+	}
+
+	return e.direntSize
+}
+
+// calcDirentDataSize calculates the serialized EROFS dirent data size for a
+// directory. For multi-block directories, this includes inter-block padding.
+func (w *erofsWriter) calcDirentDataSize(e *erofsEntry) int {
 	names := direntNames(e)
 	nEntries := len(names)
 	if len(e.children) == 0 {

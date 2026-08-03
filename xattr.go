@@ -61,9 +61,7 @@ func loadXattrs(b *file, stat *Stat) (err error) {
 		return fmt.Errorf("xattr body too small for nid %d: %w", b.nid, ErrInvalid)
 	}
 	var xh disk.XattrHeader
-	if _, err := binary.Decode(xb[:disk.SizeXattrBodyHeader], binary.LittleEndian, &xh); err != nil {
-		return err
-	}
+	xh.Unmarshal(xb)
 	xb = xb[disk.SizeXattrBodyHeader:]
 
 	for i := 0; i < int(xh.SharedCount); i++ {
@@ -79,10 +77,7 @@ func loadXattrs(b *file, stat *Stat) (err error) {
 				return fmt.Errorf("xattr shared block too small for nid %d: %w", b.nid, ErrInvalid)
 			}
 		}
-		var xattrAddr uint32
-		if _, err := binary.Decode(xb[:4], binary.LittleEndian, &xattrAddr); err != nil {
-			return err
-		}
+		xattrAddr := binary.LittleEndian.Uint32(xb[:4])
 
 		// TODO: Cache shared xattr blocks
 		// xattrAddr counts 4-byte units from the shared xattr area, and is
@@ -98,10 +93,7 @@ func loadXattrs(b *file, stat *Stat) (err error) {
 			return fmt.Errorf("shared xattr block too small for nid %d: %w", b.nid, ErrInvalid)
 		}
 		var xattrEntry disk.XattrEntry
-		if _, err := binary.Decode(sb[:disk.SizeXattrEntry], binary.LittleEndian, &xattrEntry); err != nil {
-			b.img.putBlock(sblk)
-			return err
-		}
+		xattrEntry.Unmarshal(sb)
 		sb = sb[disk.SizeXattrEntry:]
 		var prefix string
 		if xattrEntry.NameIndex&0x80 == 0x80 {
@@ -149,9 +141,7 @@ func loadXattrs(b *file, stat *Stat) (err error) {
 		}
 
 		var xattrEntry disk.XattrEntry
-		if _, err := binary.Decode(xb[:disk.SizeXattrEntry], binary.LittleEndian, &xattrEntry); err != nil {
-			return err
-		}
+		xattrEntry.Unmarshal(xb)
 		pos += disk.SizeXattrEntry
 		xb = xb[disk.SizeXattrEntry:]
 		var prefix string

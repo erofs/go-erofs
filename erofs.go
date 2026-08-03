@@ -348,11 +348,11 @@ func (img *image) deviceBlocks() []uint64 {
 	return blocks
 }
 
-// openDirect returns an io.Reader for a file's data that reads directly
-// from the underlying metadata reader, bypassing the block-at-a-time
-// Read path. Returns nil if direct reading is not possible (e.g.
-// chunk-based or compressed files).
-func (img *image) openDirect(ino *inode) io.Reader {
+// openDirect returns a reader covering a file's entire data range, so it can
+// be read in one go instead of a block at a time. Returns nil when the layout
+// cannot be expressed as one contiguous physical range: a sparse or fragmented
+// chunk file, a multi-block inline file, or a compressed one.
+func (img *image) openDirect(ino *inode) *io.SectionReader {
 	if ino.size <= 0 {
 		return nil
 	}
@@ -422,12 +422,15 @@ func (img *image) openDirect(ino *inode) io.Reader {
 			}
 		}
 
-		// All chunks contiguous — resolve through the device.
+		// All chunks contiguous — resolve through the device, using the same
+		// mapping loadBlock applies so both paths agree on where data lives.
 		dataOffset := int64(startBlock) << img.sb.BlkSizeBits
-		if deviceID > 0 && int(deviceID) <= len(img.devices) {
-			return io.NewSectionReader(img.devices[deviceID-1].device, dataOffset, ino.size)
+		reader, mapped, err := img.mapDev(deviceID, dataOffset)
+		if err != nil {
+			return nil
 		}
-		return io.NewSectionReader(img.meta, dataOffset, ino.size)
+
+		return io.NewSectionReader(reader, mapped, ino.size)
 	default:
 		return nil
 	}
@@ -1016,6 +1019,23 @@ type file struct {
 	// Mutable fields, open file should not be accessed concurrently
 	offset int64  // current offset for read operations
 	info   *inode // cached inode
+
+	// direct serves reads straight from the backing device when the file's
+	// data is one contiguous range. Resolved once and memoized, including
+	// the nil answer: for chunk-based files openDirect reads the chunk index
+	// to prove contiguity, which must not happen on every Read.
+	direct        *io.SectionReader
+	directChecked bool
+}
+
+// directReader returns a whole-file reader when the layout allows one.
+func (b *file) directReader(ino *inode) *io.SectionReader {
+	if !b.directChecked {
+		b.directChecked = true
+		b.direct = b.img.openDirect(ino)
+	}
+
+	return b.direct
 }
 
 func (b *file) readInfo() (ino *inode, err error) {
@@ -1035,15 +1055,14 @@ func (b *file) readInfo() (ino *inode, err error) {
 		blk.end = disk.SizeInodeExtended
 	}
 
+	// The block is scratch space for decoding: nothing in the returned inode
+	// points into it, so it always goes straight back to the pool. Deferring
+	// the put before the recover keeps it to exactly one, panic or not.
+	defer b.img.putBlock(blk)
 	defer func() {
-		v := recover()
-		if v != nil {
+		if v := recover(); v != nil {
 			err = fmt.Errorf("file format error: %v", v)
 		}
-		if err != nil {
-			b.img.putBlock(blk)
-		}
-
 	}()
 
 	buf := blk.bytes()
@@ -1052,17 +1071,16 @@ func (b *file) readInfo() (ino *inode, err error) {
 		return nil, err
 	}
 
-	var format, xcnt uint16
-	if _, err = binary.Decode(buf[:2], binary.LittleEndian, &format); err != nil {
-		return nil, err
+	if len(buf) < disk.SizeInodeCompact {
+		return nil, fmt.Errorf("inode %d truncated: %w", b.nid, ErrInvalid)
 	}
+	var xcnt uint16
+	format := binary.LittleEndian.Uint16(buf[:2])
 
 	layout := uint8((format & 0x0E) >> 1)
 	if format&0x01 == 0 {
 		var di disk.InodeCompact
-		if _, err := binary.Decode(buf[:disk.SizeInodeCompact], binary.LittleEndian, &di); err != nil {
-			return nil, err
-		}
+		di.Unmarshal(buf)
 		b.info = &inode{
 			name:        b.name,
 			nid:         b.nid,
@@ -1080,10 +1098,11 @@ func (b *file) readInfo() (ino *inode, err error) {
 		}
 		xcnt = di.XattrCount
 	} else {
-		var di disk.InodeExtended
-		if _, err = binary.Decode(buf[:disk.SizeInodeExtended], binary.LittleEndian, &di); err != nil {
-			return nil, err
+		if len(buf) < disk.SizeInodeExtended {
+			return nil, fmt.Errorf("extended inode %d truncated: %w", b.nid, ErrInvalid)
 		}
+		var di disk.InodeExtended
+		di.Unmarshal(buf)
 		b.info = &inode{
 			name:        b.name,
 			nid:         b.nid,
@@ -1106,19 +1125,11 @@ func (b *file) readInfo() (ino *inode, err error) {
 		b.info.xsize = int(xcnt-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
 	}
 
-	switch {
-	case b.info.inodeLayout == disk.LayoutFlatPlain || b.info.size == 0 || blk.end != blkSize:
-		b.img.putBlock(blk)
-	default:
-		// If the inode has trailing data used later, cache it
-		b.info.cached = blk
-	}
 	return b.info, nil
 }
 
 // statInfo reads the inode and builds a fileInfo with full stat data
-// including extended attributes. The cached block is released since
-// stat callers do not need inline data.
+// including extended attributes.
 func (b *file) statInfo() (*fileInfo, error) {
 	ino, err := b.readInfo()
 	if err != nil {
@@ -1154,10 +1165,8 @@ func (b *file) statInfo() (*fileInfo, error) {
 	if ino.mode.IsRegular() && ino.size > 0 {
 		if ino.inodeLayout == disk.LayoutChunkBased {
 			// Capture a snapshot of the fields buildChunkDataRanges needs.
-			// We must not capture ino by pointer: the caller may reuse it,
-			// and cached block is released below.
+			// We must not capture ino by pointer: the caller may reuse it.
 			inoCopy := *ino
-			inoCopy.cached = nil
 			img := b.img
 			fi.rangesLoader = func() []DataRange {
 				f := &file{img: img}
@@ -1166,11 +1175,6 @@ func (b *file) statInfo() (*fileInfo, error) {
 		} else {
 			fi.dataRanges = b.buildDataRanges(ino)
 		}
-	}
-	// Release cached block - stat callers don't need inline data
-	if ino.cached != nil {
-		b.img.putBlock(ino.cached)
-		ino.cached = nil
 	}
 	return fi, nil
 }
@@ -1300,6 +1304,27 @@ func (b *file) Read(p []byte) (int, error) {
 		return 0, err
 	}
 
+	// Whole-file fast path. The block loop below issues one ReadAt per
+	// filesystem block no matter how much the caller asked for, which for a
+	// large file means thousands of round trips to serve a single Read.
+	if sr := b.directReader(fi); sr != nil {
+		if b.offset >= fi.size {
+			return 0, io.EOF
+		}
+		if remaining := fi.size - b.offset; int64(len(p)) > remaining {
+			p = p[:remaining]
+		}
+		// ReadAt fills p completely or reports why not, which preserves the
+		// block loop's guarantee that a single Read fills the buffer.
+		n, err := sr.ReadAt(p, b.offset)
+		b.offset += int64(n)
+		if errors.Is(err, io.EOF) && n == len(p) {
+			err = nil
+		}
+
+		return n, err
+	}
+
 	var n int
 	for len(p) > 0 {
 		if b.offset >= fi.size {
@@ -1324,11 +1349,51 @@ func (b *file) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (b *file) Close() error {
-	if b.info != nil && b.info.cached != nil {
-		b.img.putBlock(b.info.cached)
-		b.info.cached = nil
+// WriteTo streams the rest of the file to w.
+//
+// Implementing io.WriterTo lets io.Copy hand the whole range to the
+// destination at once instead of shuttling it through a fixed-size
+// intermediate buffer, which is what makes extracting a file cost a handful
+// of reads rather than one per buffer's worth.
+func (b *file) WriteTo(w io.Writer) (int64, error) {
+	fi, err := b.readInfo()
+	if err != nil {
+		return 0, err
 	}
+	if b.offset >= fi.size {
+		return 0, nil
+	}
+
+	if sr := b.directReader(fi); sr != nil {
+		n, err := io.Copy(w, io.NewSectionReader(sr, b.offset, fi.size-b.offset))
+		b.offset += n
+
+		return n, err
+	}
+
+	var total int64
+	for b.offset < fi.size {
+		blk, err := b.img.loadBlock(fi, b.offset)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return total, nil
+			}
+
+			return total, err
+		}
+		nw, werr := w.Write(blk.bytes())
+		b.img.putBlock(blk)
+		total += int64(nw)
+		b.offset += int64(nw)
+		if werr != nil {
+			return total, werr
+		}
+	}
+
+	return total, nil
+}
+
+func (b *file) Close() error {
 	return nil
 }
 
@@ -1386,15 +1451,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 
 		var dirents [2]disk.Dirent
 
-		readN, err := binary.Decode(buf[:12], binary.LittleEndian, &dirents[0])
-		if err != nil {
-			d.img.putBlock(b)
-			return nil, fmt.Errorf("decode failed: %w", err)
-		}
-		if readN != 12 {
-			d.img.putBlock(b)
-			return nil, errors.New("invalid dirent: not fully decoded")
-		}
+		dirents[0].Unmarshal(buf)
 
 		entryN := dirents[0].NameOff / disk.SizeDirent
 		bufLen := len(buf)
@@ -1413,15 +1470,7 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 					d.img.putBlock(b)
 					return ents, fmt.Errorf("dirent entry %d exceeds block: %w", i+1, ErrInvalid)
 				}
-				readN, err := binary.Decode(buf[start:start+int(disk.SizeDirent)], binary.LittleEndian, &dirents[1])
-				if err != nil {
-					d.img.putBlock(b)
-					return nil, fmt.Errorf("decode failed: %w", err)
-				}
-				if readN != 12 {
-					d.img.putBlock(b)
-					return nil, errors.New("invalid dirent: not fully decoded")
-				}
+				dirents[1].Unmarshal(buf[start:])
 				if int(dirents[0].NameOff) > bufLen || int(dirents[1].NameOff) > bufLen || dirents[1].NameOff < dirents[0].NameOff {
 					d.img.putBlock(b)
 					return ents, fmt.Errorf("invalid dirent name offset range [%d:%d] (buf size %d): %w",
@@ -1559,9 +1608,7 @@ func blockFirstName(buf []byte) ([]byte, error) {
 		return nil, fmt.Errorf("directory block too small: %w", ErrInvalid)
 	}
 	var first disk.Dirent
-	if _, err := binary.Decode(buf[:disk.SizeDirent], binary.LittleEndian, &first); err != nil {
-		return nil, fmt.Errorf("decode failed: %w", err)
-	}
+	first.Unmarshal(buf)
 	entryN := first.NameOff / disk.SizeDirent
 	if entryN == 0 || int(first.NameOff) > len(buf) {
 		return nil, fmt.Errorf("invalid name offset %d: %w", first.NameOff, ErrInvalid)
@@ -1595,9 +1642,7 @@ func blockDirent(buf []byte, i, entryN uint16) (disk.Dirent, []byte, error) {
 	if off+disk.SizeDirent > len(buf) {
 		return de, nil, fmt.Errorf("dirent %d offset %d out of range: %w", i, off, ErrInvalid)
 	}
-	if _, err := binary.Decode(buf[off:off+disk.SizeDirent], binary.LittleEndian, &de); err != nil {
-		return de, nil, fmt.Errorf("decode dirent %d failed: %w", i, err)
-	}
+	de.Unmarshal(buf[off:])
 	var nameEnd uint16
 	if i < entryN-1 {
 		nextOff := int(disk.SizeDirent*(i+1)) + 8
@@ -1628,9 +1673,7 @@ func lookupBlock(buf, target []byte) (uint64, fs.FileMode, error) {
 		return 0, 0, fmt.Errorf("directory block too small: %w", ErrInvalid)
 	}
 	var first disk.Dirent
-	if _, err := binary.Decode(buf[:disk.SizeDirent], binary.LittleEndian, &first); err != nil {
-		return 0, 0, fmt.Errorf("decode failed: %w", err)
-	}
+	first.Unmarshal(buf)
 	if first.NameOff%disk.SizeDirent != 0 {
 		return 0, 0, fmt.Errorf("invalid name offset %d not aligned to dirent size: %w", first.NameOff, ErrInvalid)
 	}
@@ -1675,7 +1718,6 @@ type inode struct {
 	nlink       int
 	mtime       uint64
 	mtimeNs     uint32
-	cached      *block
 }
 
 func (ino *inode) flatDataOffset() int64 {

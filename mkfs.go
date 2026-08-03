@@ -996,6 +996,7 @@ type erofsEntry struct {
 	xattrSize     int  // bytes of xattr area (0 if no xattrs)
 	chunkPad      int  // 8-byte alignment pad between xattr area and chunk-index map
 	trailingSize  int
+	direntSize    int // memoized dirent data size; 0 = not yet computed
 
 	// Data block address for flat-plain files (full-image mode)
 	dataBlkAddr uint32
