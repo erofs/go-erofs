@@ -123,8 +123,9 @@ func MetadataOnly() CopyOpt {
 // Merge enables overlay merge semantics for the current CopyFrom.
 // AUFS-style whiteout files (.wh.<name>) delete the named entry from
 // prior layers, and opaque markers (.wh..wh..opq) delete all children
-// of their parent directory. The whiteout entries themselves are not
-// added to the image.
+// of their parent directory. Overlayfs char devices with rdev 0 and
+// directories with trusted.overlay.opaque are treated the same way.
+// The whiteout entries themselves are not added to the image.
 //
 // When using Merge with a source containing AUFS whiteout files, do not
 // pre-convert them; the Writer processes raw whiteout entries directly.
@@ -443,22 +444,6 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			p = "/"
 		}
 
-		// Merge mode: process whiteout markers.
-		if fsys.copyMerge && p != "/" {
-			base := path.Base(p)
-			if strings.HasPrefix(base, whiteoutPrefix) {
-				if base == opaqueWhiteout {
-					// Opaque directory: remove all prior children of parent.
-					fsys.removeChildren(path.Dir(p))
-				} else {
-					// File whiteout: remove the named entry.
-					target := path.Join(path.Dir(p), base[len(whiteoutPrefix):])
-					fsys.remove(target)
-				}
-				return nil
-			}
-		}
-
 		// Extract extended metadata from Sys().
 		var be *builder.Entry
 		switch sys := info.Sys().(type) {
@@ -478,6 +463,29 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 				Rdev:    sys.Rdev,
 				Xattrs:  sys.Xattrs,
 				Ino:     uint64(sys.Ino),
+			}
+		}
+		if be == nil {
+			be = entryFromSys(info)
+		}
+		if fsys.copyMerge && p != "/" {
+			base := path.Base(p)
+			if len(base) > len(whiteoutPrefix) && strings.HasPrefix(base, whiteoutPrefix) {
+				if base == opaqueWhiteout {
+					fsys.removeChildren(path.Dir(p))
+				} else {
+					fsys.remove(path.Join(path.Dir(p), base[len(whiteoutPrefix):]))
+				}
+				return nil
+			}
+			if info.Mode()&(fs.ModeDevice|fs.ModeCharDevice) == fs.ModeDevice|fs.ModeCharDevice && be != nil && be.Rdev == 0 {
+				fsys.remove(p)
+				return nil
+			}
+			if info.IsDir() && be != nil {
+				if _, ok := be.Xattrs["trusted.overlay.opaque"]; ok {
+					fsys.removeChildren(p)
+				}
 			}
 		}
 

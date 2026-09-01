@@ -1620,6 +1620,149 @@ func TestMergeWhiteoutDir(t *testing.T) {
 	erofstest.CheckNotExists(t, efs, "dir/file.txt")
 }
 
+func TestMergeOverlayWhiteout(t *testing.T) {
+	base := fstest.MapFS{
+		"keep.txt":   {Data: []byte("keep"), Mode: 0o644},
+		"remove.txt": {Data: []byte("gone"), Mode: 0o644},
+	}
+	overlay := fstest.MapFS{
+		"remove.txt": {
+			Mode: fs.ModeDevice | fs.ModeCharDevice | 0o600,
+			Sys:  &builder.Entry{Rdev: 0},
+		},
+		"null": {
+			Mode: fs.ModeDevice | fs.ModeCharDevice | 0o666,
+			Sys:  &builder.Entry{Rdev: 1<<8 | 3},
+		},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(base); err != nil {
+		t.Fatal("CopyFrom base:", err)
+	}
+	if err := w.CopyFrom(overlay, erofs.Merge()); err != nil {
+		t.Fatal("CopyFrom overlay:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckFile(t, efs, "keep.txt", "keep")
+	erofstest.CheckNotExists(t, efs, "remove.txt")
+	erofstest.CheckDevice(t, efs, "null", fs.ModeDevice|fs.ModeCharDevice, 1<<8|3)
+}
+
+func TestMergeOverlayOpaqueDirectory(t *testing.T) {
+	base := fstest.MapFS{
+		"dir/old.txt": {Data: []byte("old"), Mode: 0o644},
+	}
+	overlay := fstest.MapFS{
+		"dir": {
+			Mode: fs.ModeDir | 0o755,
+			Sys:  &builder.Entry{Xattrs: map[string]string{"trusted.overlay.opaque": "y"}},
+		},
+		"dir/new.txt": {Data: []byte("new"), Mode: 0o644},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(base); err != nil {
+		t.Fatal("CopyFrom base:", err)
+	}
+	if err := w.CopyFrom(overlay, erofs.Merge()); err != nil {
+		t.Fatal("CopyFrom overlay:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckNotExists(t, efs, "dir/old.txt")
+	erofstest.CheckFile(t, efs, "dir/new.txt", "new")
+}
+
+func TestMergeOverlayFromEROFSImage(t *testing.T) {
+	write := func(w *erofs.Writer, name, data string) {
+		t.Helper()
+		f, err := w.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var baseBuf testBuffer
+	bw := erofs.Create(&baseBuf)
+	write(bw, "/keep.txt", "keep")
+	write(bw, "/remove.txt", "gone")
+	if err := bw.Mkdir("/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(bw, "/dir/old.txt", "old")
+	if err := bw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var overlayBuf testBuffer
+	ow := erofs.Create(&overlayBuf)
+	if err := ow.Mknod("/remove.txt", disk.StatTypeChrdev|0o600, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := ow.Mkdir("/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ow.Setxattr("/dir", "trusted.overlay.opaque", "y"); err != nil {
+		t.Fatal(err)
+	}
+	write(ow, "/dir/new.txt", "new")
+	if err := ow.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	baseFS, err := erofs.Open(bytes.NewReader(baseBuf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlayFS, err := erofs.Open(bytes.NewReader(overlayBuf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(baseFS); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.CopyFrom(overlayFS, erofs.Merge()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	erofstest.CheckFile(t, efs, "keep.txt", "keep")
+	erofstest.CheckFile(t, efs, "dir/new.txt", "new")
+	erofstest.CheckNotExists(t, efs, "remove.txt")
+	erofstest.CheckNotExists(t, efs, "dir/old.txt")
+}
+
 // TestCreateFSUIDGID tests a variety of UID/GID values including boundary
 // values for compact (uint16) and extended (uint32) inodes.
 func TestCreateFSUIDGID(t *testing.T) {
