@@ -28,6 +28,7 @@ type Writer struct {
 	buildTime    uint64 // from WithBuildTime or buildTimer
 	buildTimeNs  uint32
 	hasBuildTime bool
+	compression  Compression
 	wErr         error               // sticky error: once set, all subsequent ops return it
 	root         *fsEntry            // root directory
 	byPath       map[string]*fsEntry // path → entry (all types)
@@ -83,6 +84,7 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		buildTime:    o.buildTime,
 		buildTimeNs:  o.buildTimeNs,
 		hasBuildTime: o.hasBuildTime,
+		compression:  o.compression,
 		root:         root,
 		byPath:       map[string]*fsEntry{"/": root},
 		dataFile:     o.dataFile,
@@ -144,6 +146,36 @@ func Merge() CopyOpt {
 func WithBlockSize(n int) CreateOpt {
 	return func(o *createOptions) {
 		o.blockSize = n
+	}
+}
+
+// Compression selects an EROFS compression algorithm. Zero value means
+// no compression.
+type Compression uint8
+
+const (
+	// CompressionNone disables compression; regular files use flat layouts.
+	CompressionNone Compression = 0
+	// CompressionLZ4 enables LZ4 compression for regular files. Each
+	// blockSize-sized chunk of source data is compressed independently;
+	// chunks that don't compress smaller are stored uncompressed (PLAIN
+	// lcluster). Produces images readable by stock mkfs.erofs / kernel
+	// erofs drivers.
+	CompressionLZ4 Compression = 1
+)
+
+// WithCompression enables compression for regular files in the produced
+// image. When enabled, files large enough to benefit are written with the
+// EROFS COMPRESSED_FULL layout; files small enough for inline storage
+// keep the inline layout.
+//
+// Note: the current implementation uses single-block logical clusters and
+// does not pack multiple lclusters into a shared pcluster (the EROFS
+// "big-pcluster" feature). Output is a valid compressed image readable by
+// stock mkfs.erofs / kernel erofs, but disk-space savings are limited.
+func WithCompression(c Compression) CreateOpt {
+	return func(o *createOptions) {
+		o.compression = c
 	}
 }
 
@@ -626,9 +658,14 @@ func (fsys *Writer) Close() error {
 		blockSize:   fsys.blockSize,
 		chunkBits:   chunkBits,
 		zeroBuf:     make([]byte, fsys.blockSize),
+		compression: fsys.compression,
+		tempDir:     fsys.tempDir,
 	}
 
 	ew.planLayout(root)
+	if err := ew.compressEntries(); err != nil {
+		return err
+	}
 	fixParentNids(root, root)
 
 	return ew.write(fsys.out)
@@ -960,6 +997,7 @@ type createOptions struct {
 	blockSize    int      // 0 = use default
 	dataFile     *os.File // external data file for metadata-only mode
 	tempDir      string   // temp directory for spool file
+	compression  Compression
 }
 
 // blockSizer may be implemented by an fs.FS to declare its block size.
@@ -1048,6 +1086,30 @@ type erofsEntry struct {
 
 	// Data block address for flat-plain files (full-image mode)
 	dataBlkAddr uint32
+
+	// Compressed regular file state. nLclusters is set during planLayout.
+	// compressEntry is called between planLayout and write: it appends the
+	// on-disk pcluster bytes (exactly nPblks blocks) to the writer's shared
+	// cspool starting at cspoolOff, fills lclusterEntries (one entry per
+	// lcluster), and sets nPblks (the actual physical block count, which
+	// may be less than nLclusters when big-pcluster grouping wins).
+	// hasBigPcluster is set when at least one CBLKCNT NONHEAD was emitted —
+	// readers in writeBlock0 / writeCompressedTrailing consult it without
+	// re-scanning lclusterEntries.
+	nLclusters      uint32
+	nPblks          uint32
+	cspoolOff       int64
+	lclusterEntries []lclusterEntry
+	hasBigPcluster  bool
+}
+
+// lclusterEntry captures the on-disk z_erofs_lcluster_index entry for one
+// logical cluster of a LayoutCompressedFull regular file.
+type lclusterEntry struct {
+	typ    uint8  // disk.ZErofsLclusterType{Plain,Head1,Nonhead}
+	pblk   uint32 // physical block address (for HEAD1 / PLAIN)
+	delta0 uint16 // lookback distance to HEAD, or (M | D0_CBLKCNT) for big-pcluster
+	delta1 uint16 // lookahead distance to the next HEAD
 }
 
 // --- Internal helpers ---

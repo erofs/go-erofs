@@ -4,11 +4,11 @@ A Go library for reading and creating [EROFS](https://erofs.docs.kernel.org/) fi
 
 ## Features
 
-- **Read** EROFS images through Go's `fs.FS` interface
-- **Create** EROFS images from directories or any `fs.FS`
+- **Read** EROFS images through Go's `fs.FS` interface, including LZ4-compressed images
+- **Create** EROFS images from directories or any `fs.FS`, with optional LZ4 compression
 - **Merge** multiple filesystem sources with overlay whiteout support
 - **Metadata-only** mode for container layer indexing (chunk-based references to original data)
-- Pure Go, no CGO — uses only the standard library
+- Pure Go, no CGO — only dependency is `github.com/pierrec/lz4/v4` for LZ4 block compression
 
 ### Status
 
@@ -20,7 +20,7 @@ A Go library for reading and creating [EROFS](https://erofs.docs.kernel.org/) fi
 - [x] Directory to erofs packing
 - [x] AUFS whiteout to overlayfs conversion
 - [x] Merge multiple filesystem layers with whiteout processing
-- [ ] Read erofs files with compression
+- [x] Read and write erofs files with LZ4 compression
 
 ## Reading an EROFS image
 

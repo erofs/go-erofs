@@ -76,15 +76,19 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 					e.chunkBits = w.minChunkBits(e.size)
 				}
 			default:
-				// Full-image mode: decide inline vs plain
-				if int(e.size) <= w.blockSize-headerSize {
-					inBlockOff := (currentOff + headerSize) % w.blockSize
-					if inBlockOff+int(e.size) <= w.blockSize {
-						e.layout = disk.LayoutFlatInline
-					} else {
-						e.layout = disk.LayoutFlatPlain
-					}
-				} else {
+				// Full-image mode: decide inline vs compressed vs plain.
+				// Inline is preferred for files that fit entirely after the
+				// inode core+xattrs because it saves a whole data block.
+				inBlockOff := (currentOff + headerSize) % w.blockSize
+				canInline := int(e.size) <= w.blockSize-headerSize &&
+					inBlockOff+int(e.size) <= w.blockSize
+				switch {
+				case canInline:
+					e.layout = disk.LayoutFlatInline
+				case w.compression != CompressionNone:
+					e.layout = disk.LayoutCompressedFull
+					e.nLclusters = uint32((e.size + uint64(w.blockSize) - 1) / uint64(w.blockSize))
+				default:
 					e.layout = disk.LayoutFlatPlain
 				}
 			}
@@ -188,6 +192,22 @@ func (w *erofsWriter) calcTrailingSize(e *erofsEntry) int {
 		}
 		if e.layout == disk.LayoutFlatInline {
 			return int(e.size)
+		}
+		if e.layout == disk.LayoutCompressedFull {
+			// COMPRESSED_FULL trailing area:
+			//   alignPad zero bytes so the map header starts at an 8-byte
+			//   boundary within the metadata zone (Z_EROFS_MAP_HEADER_START
+			//   uses round_up(end, 8)),
+			//   8 bytes z_erofs_map_header,
+			//   8 bytes reserved (Z_EROFS_FULL_INDEX_START gap),
+			//   nLclusters * 8 bytes lcluster index entries.
+			//
+			// Inode core size is always a multiple of 8 (32 or 64). xattr
+			// entries are 4-aligned, so alignPad is 0 or 4.
+			headerSize := inodeCoreSize(e) + e.xattrSize
+			alignPad := (8 - (headerSize % 8)) % 8
+			return alignPad + disk.SizeZErofsMapHeader + 8 +
+				int(e.nLclusters)*disk.SizeZErofsLclusterIndex
 		}
 		return 0
 	case disk.StatTypeDir:

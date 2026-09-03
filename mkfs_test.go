@@ -3705,3 +3705,258 @@ func TestCopyFromHardlinkRequiresSameDev(t *testing.T) {
 		t.Errorf("a ino %d == b ino %d: same Ino but different Dev must not be coalesced", aSt.Ino, bSt.Ino)
 	}
 }
+
+// TestCreateFSCompressionLZ4 round-trips files through the LZ4 writer and
+// reader. It exercises three classes of regular file:
+//   - small file that still uses inline layout (compression is skipped),
+//   - highly compressible large file (HEAD1 lclusters),
+//   - incompressible large file (PLAIN lclusters via the writer's fallback).
+//
+// Self-contained: does not require mkfs.erofs / fsck.erofs.
+func TestCreateFSCompressionLZ4(t *testing.T) {
+	const blockSize = 4096
+
+	tiny := []byte("inline-me\n")
+	// 5 blocks worth of highly compressible repeating data.
+	compressible := bytes.Repeat([]byte("ABCDEFGHIJKLMNOP"), 5*blockSize/16)
+	// 2 blocks of random-ish data that won't fit when compressed; the
+	// writer should fall back to PLAIN lclusters and still round-trip.
+	incompressible := make([]byte, 2*blockSize)
+	for i := range incompressible {
+		// Use the low byte of a multiplier to spread values; avoid Go's
+		// math/rand to keep the test deterministic without seeding.
+		incompressible[i] = byte(i*1103515245 + 12345)
+	}
+	// 1 block exact + 13 bytes — exercises the partial tail lcluster.
+	tailed := append(bytes.Repeat([]byte("hello compression world\n"), blockSize/24), []byte("trailing bytes")...)
+
+	// Multi-block (10 blocks exact) compressible file — exercises many
+	// sequential lcluster decodes with cache reuse and no tail clamp.
+	bigCompressible := bytes.Repeat([]byte("0123456789ABCDEF"), 10*blockSize/16)
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+
+	for _, c := range []struct {
+		path string
+		data []byte
+	}{
+		{"/tiny.txt", tiny},
+		{"/compressible.bin", compressible},
+		{"/incompressible.bin", incompressible},
+		{"/tailed.bin", tailed},
+		{"/big-compressible.bin", bigCompressible},
+	} {
+		f, err := w.Create(c.path)
+		if err != nil {
+			t.Fatalf("Create %s: %v", c.path, err)
+		}
+		if _, err := f.Write(c.data); err != nil {
+			t.Fatalf("Write %s: %v", c.path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close file %s: %v", c.path, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Writer.Close:", err)
+	}
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckFileBytes(t, efs, "tiny.txt", tiny)
+	erofstest.CheckFileBytes(t, efs, "compressible.bin", compressible)
+	erofstest.CheckFileBytes(t, efs, "incompressible.bin", incompressible)
+	erofstest.CheckFileBytes(t, efs, "tailed.bin", tailed)
+	erofstest.CheckFileBytes(t, efs, "big-compressible.bin", bigCompressible)
+}
+
+// TestReadAcceptsCompacted2BAdvise verifies the reader accepts images whose
+// z_erofs_map_header has the COMPACTED_2B advise bit set. Stock mkfs.erofs
+// emits this bit on any compact-layout image whose total lcluster count is
+// large enough to trigger the 2-byte-per-entry packed run; rejecting it
+// would block reading those images. The fix is checked synthetically by
+// flipping the bit on a writer-produced image (the writer doesn't emit
+// compact layout itself, but the advise bit is harmless for FULL layout
+// and the rejection happened in the shared map-header parser).
+func TestReadAcceptsCompacted2BAdvise(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+	data := bytes.Repeat([]byte("compressible data here\n"), 200)
+	f, err := w.Create("/file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	img := buf.Bytes()
+
+	// Find file.bin's nid via the reader, then locate the map header by
+	// re-parsing the inode core ourselves.
+	efs, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	fi, err := fs.Stat(efs, "file.bin")
+	if err != nil {
+		t.Fatal("Stat:", err)
+	}
+	st := fi.Sys().(*erofs.Stat)
+
+	var sb disk.SuperBlock
+	if _, err := binary.Decode(img[disk.SuperBlockOffset:disk.SuperBlockOffset+disk.SizeSuperBlock], binary.LittleEndian, &sb); err != nil {
+		t.Fatal("decode superblock:", err)
+	}
+	blockSize := int64(1) << sb.BlkSizeBits
+	iloc := int64(sb.MetaBlkAddr)*blockSize + st.Ino*disk.SizeInodeCompact
+
+	format := binary.LittleEndian.Uint16(img[iloc : iloc+2])
+	layout := uint8((format & 0x0E) >> 1)
+	if layout != disk.LayoutCompressedFull {
+		t.Fatalf("expected LayoutCompressedFull (%d), got %d", disk.LayoutCompressedFull, layout)
+	}
+	icsize := int64(disk.SizeInodeCompact)
+	if format&0x01 != 0 {
+		icsize = disk.SizeInodeExtended
+	}
+	xattrIcount := binary.LittleEndian.Uint16(img[iloc+2 : iloc+4])
+	var xsize int64
+	if xattrIcount > 0 {
+		xsize = int64(xattrIcount-1)*disk.SizeXattrEntry + disk.SizeXattrBodyHeader
+	}
+	hdrPos := (iloc + icsize + xsize + 7) &^ 7
+
+	// HAdvise lives at bytes 4-5 of the 8-byte map header.
+	const hAdviseOff = 4
+	img[hdrPos+hAdviseOff] |= byte(disk.ZErofsAdviseCompacted2B)
+
+	efs2, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("Open after setting COMPACTED_2B:", err)
+	}
+	erofstest.CheckFileBytes(t, efs2, "file.bin", data)
+}
+
+// TestCreateFSCompressionBigPcluster verifies that compression with the big-
+// pcluster encoding actually shrinks images for compressible content and that
+// the result round-trips through the reader. Single-lcluster fallback for
+// incompressible content also keeps working.
+func TestCreateFSCompressionBigPcluster(t *testing.T) {
+	const blockSize = 4096
+
+	// Highly compressible: ~64 KiB of repeating text. The writer should
+	// group up to 4 lclusters per pcluster, so this file should land in
+	// roughly 64 KiB / 4 = 16 KiB of pclusters (plus index overhead).
+	bigCompressible := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog\n"), 1500)
+
+	// Incompressible: random-ish bytes that LZ4 can't shrink. Each lcluster
+	// must fall back to PLAIN; the on-disk size should not be much smaller
+	// than the input.
+	incompressible := make([]byte, 8*blockSize)
+	for i := range incompressible {
+		incompressible[i] = byte(i*1103515245 + 12345)
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+	for _, c := range []struct {
+		path string
+		data []byte
+	}{
+		{"/big.txt", bigCompressible},
+		{"/rand.bin", incompressible},
+	} {
+		f, err := w.Create(c.path)
+		if err != nil {
+			t.Fatalf("Create %s: %v", c.path, err)
+		}
+		if _, err := f.Write(c.data); err != nil {
+			t.Fatalf("Write %s: %v", c.path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close %s: %v", c.path, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Writer.Close:", err)
+	}
+
+	imgSize := int64(len(buf.Bytes()))
+	inputSize := int64(len(bigCompressible) + len(incompressible))
+	// big.txt is 66 KiB and should compress hugely; rand.bin is 32 KiB and
+	// stays roughly its size as PLAIN lclusters. An assertion that the
+	// image is at least ~30% smaller than the input is generous: with
+	// big-pcluster on, the compressible file alone should shrink ~4x.
+	if imgSize >= inputSize*7/10 {
+		t.Errorf("image size %d ≥ 70%% of input size %d — big-pcluster grouping didn't shrink output as expected", imgSize, inputSize)
+	}
+	t.Logf("image=%d bytes, input=%d bytes, ratio=%.1f%%",
+		imgSize, inputSize, 100*float64(imgSize)/float64(inputSize))
+
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	erofstest.CheckFileBytes(t, efs, "big.txt", bigCompressible)
+	erofstest.CheckFileBytes(t, efs, "rand.bin", incompressible)
+}
+
+// TestReadRejectsBigPclusterWithoutSBFeature verifies the reader rejects an
+// image that sets BIG_PCLUSTER_1 in a per-inode map header but doesn't set
+// the matching superblock feature bit. The kernel rejects this combination
+// as -EFSCORRUPTED; we mirror that so a buggy writer is caught locally
+// instead of producing kernel-unreadable images that pass our own roundtrip.
+func TestReadRejectsBigPclusterWithoutSBFeature(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithCompression(erofs.CompressionLZ4))
+	// Need enough data for the writer to emit a multi-lcluster pcluster.
+	data := bytes.Repeat([]byte("the quick brown fox\n"), 4096)
+	f, err := w.Create("/file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	img := buf.Bytes()
+
+	// Sanity check: the image really uses BIG_PCLUSTER. If not, this test
+	// isn't exercising what it claims to.
+	const fiOff = disk.SuperBlockOffset + 80
+	sbFeatBefore := binary.LittleEndian.Uint32(img[fiOff : fiOff+4])
+	if sbFeatBefore&disk.FeatureIncompatBigPcluster == 0 {
+		t.Fatalf("writer didn't set BIG_PCLUSTER feature bit (feat=0x%x); test won't exercise the check", sbFeatBefore)
+	}
+
+	// Clear the BIG_PCLUSTER bit only, leaving LZ4_0PADDING etc. in place.
+	binary.LittleEndian.PutUint32(img[fiOff:fiOff+4], sbFeatBefore&^disk.FeatureIncompatBigPcluster)
+
+	efs, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	_, err = fs.ReadFile(efs, "file.bin")
+	if err == nil {
+		t.Fatal("expected ReadFile to fail when BIG_PCLUSTER_1 is set but sb feature is cleared")
+	}
+	if !errors.Is(err, erofs.ErrInvalid) {
+		t.Errorf("expected ErrInvalid, got %v", err)
+	}
+}
