@@ -958,3 +958,55 @@ func FuzzImageCorruptInode(f *testing.F) {
 		exerciseFS(fsys)
 	})
 }
+
+// buildMinimalCompressedImage creates a small valid LZ4-compressed erofs
+// image (full lcluster layout) for use as a fuzz seed.
+func buildMinimalCompressedImage(t testing.TB) []byte {
+	t.Helper()
+	erofstest.RequireMkfsLZ4(t)
+
+	tc := erofstest.TarContext{}.WithModTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	wt := erofstest.TarAll(
+		tc.Dir("/dir", 0755),
+		// Repeating content so the file is actually compressed (mkfs.erofs
+		// otherwise falls back to PLAIN).
+		tc.File("/dir/repeat.bin", bytes.Repeat([]byte{0xAB, 0xCD}, 8192), 0644),
+		tc.File("/dir/zeros.bin", bytes.Repeat([]byte{0}, 16384), 0644),
+		tc.File("/empty", []byte{}, 0644),
+	)
+	tarStream := erofstest.TarFromWriterTo(wt)
+	defer func() { _ = tarStream.Close() }()
+
+	path := filepath.Join(t.TempDir(), "minimal-compressed.erofs")
+	if err := erofstest.ConvertTarErofs(context.Background(), tarStream, path, "",
+		[]string{"-zlz4", "-Elegacy-compress"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// FuzzImageOpenCompressed fuzzes the raw bytes of a compressed (LZ4)
+// erofs image. Open + exerciseFS must never panic, regardless of how the
+// compressed metadata or pcluster data is mangled.
+func FuzzImageOpenCompressed(f *testing.F) {
+	seed := buildMinimalCompressedImage(f)
+	f.Add(seed)
+
+	// A truncated seed exposes early-EOF handling in the compressed path.
+	if len(seed) > 2048 {
+		f.Add(seed[:2048])
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		r := bytes.NewReader(data)
+		fsys, err := erofs.Open(r)
+		if err != nil {
+			return
+		}
+		exerciseFS(fsys)
+	})
+}
