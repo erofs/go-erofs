@@ -77,7 +77,7 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 				}
 			default:
 				// Full-image mode: decide inline vs plain
-				if int(e.size) <= w.blockSize-headerSize {
+				if !w.noInlineData && int(e.size) <= w.blockSize-headerSize {
 					inBlockOff := (currentOff + headerSize) % w.blockSize
 					if inBlockOff+int(e.size) <= w.blockSize {
 						e.layout = disk.LayoutFlatInline
