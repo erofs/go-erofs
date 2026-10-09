@@ -39,13 +39,14 @@ type Writer struct {
 	copyMerge        bool   // merge mode: apply whiteouts
 	copyDeviceID     uint16 // device ID assigned to current MetadataOnly CopyFrom
 
-	dataFile *os.File // external data file (nil = spool mode)
-	dataOff  int64    // current byte offset in data file
-	spool    *os.File // temp spool (created lazily)
-	spoolOff int64    // current byte offset in spool
-	tempDir  string   // from WithTempDir
-	cpBuf    []byte   // shared buffer for io.Copy into File
-	padBuf   []byte   // shared zero buffer for padding (block-sized, lazy)
+	dataFile     *os.File // external data file (nil = spool mode)
+	dataOff      int64    // current byte offset in data file
+	spool        *os.File // temp spool (created lazily)
+	spoolOff     int64    // current byte offset in spool
+	tempDir      string   // from WithTempDir
+	noInlineData bool     // from WithNoInlineData
+	cpBuf        []byte   // shared buffer for io.Copy into File
+	padBuf       []byte   // shared zero buffer for padding (block-sized, lazy)
 }
 
 // File is a writable regular file returned by Writer.Create.
@@ -87,6 +88,7 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		byPath:       map[string]*fsEntry{"/": root},
 		dataFile:     o.dataFile,
 		tempDir:      o.tempDir,
+		noInlineData: o.noInlineData,
 	}
 
 	if o.blockSize != 0 {
@@ -170,6 +172,15 @@ func WithDataFile(f *os.File) CreateOpt {
 func WithTempDir(dir string) CreateOpt {
 	return func(o *createOptions) {
 		o.tempDir = dir
+	}
+}
+
+// WithNoInlineData disables tail-packing (inline data) for regular files so
+// that every non-empty regular file is stored in block-aligned flat-plain
+// data blocks (for example, when mounting the image with FSDAX).
+func WithNoInlineData() CreateOpt {
+	return func(o *createOptions) {
+		o.noInlineData = true
 	}
 }
 
@@ -620,12 +631,13 @@ func (fsys *Writer) Close() error {
 	}
 
 	ew := &erofsWriter{
-		buildTime:   buildTime,
-		buildTimeNs: fsys.buildTimeNs,
-		devices:     fsys.devices,
-		blockSize:   fsys.blockSize,
-		chunkBits:   chunkBits,
-		zeroBuf:     make([]byte, fsys.blockSize),
+		buildTime:    buildTime,
+		buildTimeNs:  fsys.buildTimeNs,
+		devices:      fsys.devices,
+		blockSize:    fsys.blockSize,
+		chunkBits:    chunkBits,
+		noInlineData: fsys.noInlineData,
+		zeroBuf:      make([]byte, fsys.blockSize),
 	}
 
 	ew.planLayout(root)
@@ -960,6 +972,7 @@ type createOptions struct {
 	blockSize    int      // 0 = use default
 	dataFile     *os.File // external data file for metadata-only mode
 	tempDir      string   // temp directory for spool file
+	noInlineData bool     // disable tail-packing for regular files
 }
 
 // blockSizer may be implemented by an fs.FS to declare its block size.
