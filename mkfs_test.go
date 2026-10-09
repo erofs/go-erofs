@@ -3705,3 +3705,47 @@ func TestCopyFromHardlinkRequiresSameDev(t *testing.T) {
 		t.Errorf("a ino %d == b ino %d: same Ino but different Dev must not be coalesced", aSt.Ino, bSt.Ino)
 	}
 }
+
+// TestCreateWithNoInlineData verifies that WithNoInlineData stores small
+// regular files (<4KiB) with LayoutFlatPlain rather than tail-packing them
+// with LayoutFlatInline.
+func TestCreateWithNoInlineData(t *testing.T) {
+	build := func(t *testing.T, opts ...erofs.CreateOpt) fs.FS {
+		t.Helper()
+		var buf testBuffer
+		w := erofs.Create(&buf, opts...)
+		f, err := w.Create("/small.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte("small file\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		erofstest.FsckErofsBytes(t, buf.Bytes())
+		efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return efs
+	}
+
+	// Default: small file fits in the metadata block tail and uses LayoutFlatInline.
+	defaultFS := build(t)
+	erofstest.CheckFile(t, defaultFS, "small.txt", "small file\n")
+	if st := erofstest.Stat(t, defaultFS, "small.txt"); st.InodeLayout != disk.LayoutFlatInline {
+		t.Fatalf("default small.txt InodeLayout = %d, want %d (LayoutFlatInline)", st.InodeLayout, disk.LayoutFlatInline)
+	}
+
+	// WithNoInlineData: small file uses block-aligned LayoutFlatPlain.
+	noInlineFS := build(t, erofs.WithNoInlineData())
+	erofstest.CheckFile(t, noInlineFS, "small.txt", "small file\n")
+	if st := erofstest.Stat(t, noInlineFS, "small.txt"); st.InodeLayout != disk.LayoutFlatPlain {
+		t.Fatalf("WithNoInlineData small.txt InodeLayout = %d, want %d (LayoutFlatPlain)", st.InodeLayout, disk.LayoutFlatPlain)
+	}
+}
