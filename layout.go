@@ -1,13 +1,16 @@
 package erofs
 
 import (
+	"context"
+	"fmt"
+	"math"
 	"sort"
 
 	"github.com/erofs/go-erofs/internal/disk"
 )
 
 // planLayout assigns NIDs and determines trailing data sizes for all entries.
-func (w *erofsWriter) planLayout(root *erofsEntry) {
+func (w *erofsWriter) planLayout(root *erofsEntry) error {
 	// Collect all entries in a deterministic order (DFS, pre-order).
 	// DFS keeps directory contents close to their parent inode,
 	// improving locality for operations like find and ls -lR.
@@ -26,6 +29,14 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	}
 	walk(root)
 
+	return w.planEntries(context.Background(), root, uint64(math.MaxInt))
+}
+
+// planEntries is shared by the ordinary writer and the bounded layout builder.
+// Entries must already be in deterministic DFS order.
+func (w *erofsWriter) planEntries(ctx context.Context, root *erofsEntry, limit uint64) error {
+	limit = min(limit, uint64(math.MaxInt)-uint64(w.blockSize))
+
 	// Secondary hard-link entries share the primary's inode; count only primaries.
 	var inodeCount uint64
 	for _, e := range w.entries {
@@ -43,6 +54,9 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	// primary's finalized NID to them.
 	currentOff := 0 // byte offset from metaStartPos
 	for _, e := range w.entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if e.hardLinkPrimary != nil {
 			continue // skip; NID assigned in second pass below
 		}
@@ -53,7 +67,7 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 		// Decide compact (32B) vs extended (64B) inode.
 		e.compact = e.uid <= 0xFFFF && e.gid <= 0xFFFF &&
 			e.nlink <= 0xFFFF && e.size <= 0xFFFFFFFF &&
-			e.mtime == w.buildTime && e.mtimeNs == 0
+			e.mtime == w.buildTime && e.mtimeNs == w.buildTimeNs
 
 		inodeSize := disk.SizeInodeExtended
 		if e.compact {
@@ -108,9 +122,19 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 			e.layout = disk.LayoutFlatPlain
 		}
 
+		// Bound arithmetic before converting sizes to int or multiplying indexes.
+		if e.size > uint64(math.MaxInt-w.blockSize) {
+			return fmt.Errorf("inode size exceeds addressable layout")
+		}
+		if e.layout == disk.LayoutChunkBased {
+			n := (e.size + uint64(w.entryChunkSize(e)) - 1) / uint64(w.entryChunkSize(e))
+			if n > limit/uint64(w.chunkIndexSize()) {
+				return fmt.Errorf("chunk indexes exceed metadata limit")
+			}
+		}
 		// Recalculate trailing size now that layout is decided
 		e.trailingSize = w.calcTrailingSize(e)
-		e.chunkPad = chunkIndexPad(e)
+		e.chunkPad = w.chunkIndexPad(e)
 
 		totalInodeSize := headerSize + e.chunkPad + e.trailingSize
 		// Pad to 32-byte boundary
@@ -133,7 +157,7 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 				// Fall back to flat-plain (data would cross block boundary)
 				e.layout = disk.LayoutFlatPlain
 				e.trailingSize = w.calcTrailingSize(e)
-				e.chunkPad = chunkIndexPad(e)
+				e.chunkPad = w.chunkIndexPad(e)
 				totalInodeSize = headerSize + e.chunkPad + e.trailingSize
 				if totalInodeSize%32 != 0 {
 					totalInodeSize = (totalInodeSize + 31) & ^31
@@ -141,6 +165,9 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 			}
 		}
 
+		if uint64(currentOff) > limit || uint64(totalInodeSize) > limit-uint64(currentOff) {
+			return fmt.Errorf("inode metadata exceeds layout limit")
+		}
 		currentOff += totalInodeSize
 	}
 
@@ -152,6 +179,7 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	}
 
 	w.rootNid = root.nid
+	return nil
 }
 
 // chunkIndexPad returns the padding inserted between an inode's xattr area and
@@ -164,12 +192,12 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 // always a multiple of the unit, so only the xattr area can push the map off
 // alignment. Non-chunk layouts (inline data) are read without this alignment
 // and so must not be padded.
-func chunkIndexPad(e *erofsEntry) int {
+func (w *erofsWriter) chunkIndexPad(e *erofsEntry) int {
 	if e.layout != disk.LayoutChunkBased || e.trailingSize == 0 {
 		return 0
 	}
-	if r := (inodeCoreSize(e) + e.xattrSize) % disk.SizeChunkIndex; r != 0 {
-		return disk.SizeChunkIndex - r
+	if r := (inodeCoreSize(e) + e.xattrSize) % w.chunkIndexSize(); r != 0 {
+		return w.chunkIndexSize() - r
 	}
 	return 0
 }
@@ -184,7 +212,7 @@ func (w *erofsWriter) calcTrailingSize(e *erofsEntry) int {
 			}
 			cs := w.entryChunkSize(e)
 			nchunks := (int(e.size) + cs - 1) / cs
-			return nchunks * disk.SizeChunkIndex
+			return nchunks * w.chunkIndexSize()
 		}
 		if e.layout == disk.LayoutFlatInline {
 			return int(e.size)
