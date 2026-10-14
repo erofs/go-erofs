@@ -640,7 +640,9 @@ func (fsys *Writer) Close() error {
 		zeroBuf:      make([]byte, fsys.blockSize),
 	}
 
-	ew.planLayout(root)
+	if err := ew.planLayout(root); err != nil {
+		return err
+	}
 	fixParentNids(root, root)
 
 	return ew.write(fsys.out)

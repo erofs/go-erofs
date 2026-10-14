@@ -80,3 +80,50 @@ w.Symlink("hello.txt", "/link")
 w.Close()
 outFile.Close()
 ```
+
+## Planning metadata around an existing data area
+
+`LayoutBuilder` is a lower-level alternative for callers that manage data blocks
+themselves. It produces a single-device, uncompressed image with compact 32-bit
+chunk indexes. It does not open source files, deduplicate content, spool payload,
+or change the meaning of the existing `DataRange` API.
+
+1. Create a builder with root `Node` metadata and explicit `MemoryLimit` and
+   `MetadataLimit` in `LayoutOptions`. The default block size is 4096 bytes.
+2. Add nodes in increasing name order within each parent. Parents must exist
+   before children. `Link` adds a second name for an existing non-directory
+   inode; link counts reflect the names supplied to the builder.
+3. Call `AddBlocks` for each regular file. References are zero-based block
+   numbers in the caller's data area, or `HoleBlock`. The number of references
+   must equal the file size rounded up to a block. A repeated reference shares
+   storage without merging inode identity. The caller pads a partial data block.
+4. `Prepare(ctx, dataBlocks)` fixes the layout and transfers ownership to the
+   returned `Layout`. `Size`, `DataOffset`, and `DataSize` describe its regions.
+5. `WriteMetadata(ctx, writerAt)` writes the superblock, directories, symlinks,
+   inodes and chunk indexes. It leaves the data area untouched. Supply the data
+   blocks separately before treating the image as complete. An unwritten data
+   area is **not** a logical file hole.
+6. Close the layout to release its indexes. Close the builder on a construction
+   error. Neither object closes caller-owned files. Metadata writes may be
+   repeated before close; errors can leave partial output, which is not a
+   successfully completed image. Methods are not safe for concurrent use.
+
+The memory budget admits node/string storage, maps, slice capacities (including
+old/new capacity during growth), traversal arrays, directory/xattr serialization
+workspace, and output buffers **before** allocation. `MemoryUsage` reports the
+current reservation and its peak. This is a bound on controlled allocations, not
+on process RSS: allocator rounding, garbage collection and caller allocations
+still affect process memory. Close drops references without forcing global GC.
+The metadata budget bounds image bytes outside the data area. Address overflow,
+missing data, unsupported metadata and budget exhaustion return errors; the
+builder does not silently change block size or discard entries.
+
+`Node` accepts optional xattrs. Applications that omit them retain their own
+no-xattr policy. Build time and node timestamps are explicit, and the UUID is
+zero; input order and metadata determine the output, not the wall clock.
+
+Regression tests compare reader-visible contents and metadata, hard-link
+identity, sparse blocks, repeated output and budget/error behavior. Native
+`fsck.erofs` provides an independent check when available. Blocks larger than the
+host page size are covered by the Go checks because native erofs-utils rejects
+them on that host; 4096-byte images receive both checks on supported CI hosts.

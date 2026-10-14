@@ -25,6 +25,10 @@ type onlyWriter struct{ io.Writer }
 
 // erofsWriter serializes EROFS metadata to an io.Writer.
 type erofsWriter struct {
+	reservedDataBlocks uint32 // primary-device payload supplied by a Layout caller
+
+	compactIndexes bool // use primary-device 32-bit block addresses
+
 	entries      []*erofsEntry // all entries in NID order
 	rootNid      uint64
 	metaBlkAddr  uint32
@@ -239,7 +243,10 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 			dataBlocks += (ds + w.blockSize - 1) / w.blockSize
 		}
 	}
-	totalBlocks := w.sbAreaBlocks() + metaBlocks + dataBlocks
+	totalBlocks := uint64(w.sbAreaBlocks()) + uint64(metaBlocks) + uint64(dataBlocks) + uint64(w.reservedDataBlocks)
+	if totalBlocks > math.MaxUint32 {
+		return fmt.Errorf("image block count exceeds 32-bit range")
+	}
 
 	var featureIncompat uint32
 	var extraDevices uint16
@@ -412,7 +419,10 @@ func (w *erofsWriter) writeInode(buf io.Writer, e *erofsEntry) error {
 	switch e.mode & disk.StatTypeMask {
 	case disk.StatTypeReg:
 		if e.layout == disk.LayoutChunkBased {
-			inodeData = disk.LayoutChunkFormatIndexes | uint32(w.entryChunkBits(e))
+			inodeData = uint32(w.entryChunkBits(e))
+			if !w.compactIndexes {
+				inodeData |= disk.LayoutChunkFormatIndexes
+			}
 		} else if e.layout == disk.LayoutFlatPlain && e.size > 0 {
 			inodeData = e.dataBlkAddr
 		}
@@ -506,22 +516,16 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 	blocksPerChunk := cs / w.blockSize
 	nchunks := (int(e.size) + cs - 1) / cs
 
-	// Null chunk index (no mapping): StartBlkHi=0xFFFF, DeviceID=0, StartBlkLo=NullAddr.
-	var nullIdx [disk.SizeChunkIndex]byte
-	binary.LittleEndian.PutUint16(nullIdx[0:2], 0xFFFF)
-	binary.LittleEndian.PutUint32(nullIdx[4:8], nullAddr)
-
 	if len(e.chunks) > 0 {
 		// Walk source chunks and emit one index per logical chunk.
 		// Source chunks use block-granularity counts; we step by blocksPerChunk.
 		// A chunk with PhysicalBlock == builder.NullPhysicalBlock is a hole:
 		// emit nullIdx entries for its block span.
-		var scratch [disk.SizeChunkIndex]byte
 		ci := 0   // index into source chunks
 		coff := 0 // block offset within current source chunk
 		for n := 0; n < nchunks; n++ {
 			if ci >= len(e.chunks) {
-				if _, err := buf.Write(nullIdx[:]); err != nil {
+				if _, err := w.writeChunkIndex(buf, builder.NullPhysicalBlock, 0); err != nil {
 					return err
 				}
 				continue
@@ -529,15 +533,15 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 			c := e.chunks[ci]
 			if c.PhysicalBlock == builder.NullPhysicalBlock {
 				// Hole chunk: emit a null index entry.
-				if _, err := buf.Write(nullIdx[:]); err != nil {
+				if _, err := w.writeChunkIndex(buf, builder.NullPhysicalBlock, 0); err != nil {
 					return err
 				}
 			} else {
 				phys := c.PhysicalBlock + uint64(coff)
-				binary.LittleEndian.PutUint16(scratch[0:2], uint16(phys>>32))
-				binary.LittleEndian.PutUint16(scratch[2:4], c.DeviceID)
-				binary.LittleEndian.PutUint32(scratch[4:8], uint32(phys))
-				if _, err := buf.Write(scratch[:]); err != nil {
+				if phys < c.PhysicalBlock {
+					return fmt.Errorf("chunk block address overflow")
+				}
+				if _, err := w.writeChunkIndex(buf, phys, c.DeviceID); err != nil {
 					return err
 				}
 			}
@@ -549,13 +553,52 @@ func (w *erofsWriter) writeChunkIndexes(buf io.Writer, e *erofsEntry) error {
 		}
 	} else {
 		for n := 0; n < nchunks; n++ {
-			if _, err := buf.Write(nullIdx[:]); err != nil {
+			if _, err := w.writeChunkIndex(buf, builder.NullPhysicalBlock, 0); err != nil {
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+// chunkIndexSize is shared by sizing, alignment and serialization.
+func (w *erofsWriter) chunkIndexSize() int {
+	if w.compactIndexes {
+		return 4
+	}
+	return disk.SizeChunkIndex
+}
+
+func (w *erofsWriter) writeChunkIndex(out io.Writer, block uint64, device uint16) (int, error) {
+	var b [disk.SizeChunkIndex]byte
+	switch {
+	case block == builder.NullPhysicalBlock:
+		if w.compactIndexes {
+			binary.LittleEndian.PutUint32(b[:4], nullAddr)
+		} else {
+			binary.LittleEndian.PutUint16(b[:2], 0xffff)
+			binary.LittleEndian.PutUint32(b[4:], nullAddr)
+		}
+	case w.compactIndexes:
+		// 0xffffffff is the hole marker, not an addressable block.
+		if device != 0 || block >= uint64(nullAddr) {
+			return 0, fmt.Errorf("compact chunk requires a primary-device address below %#x", nullAddr)
+		}
+		binary.LittleEndian.PutUint32(b[:4], uint32(block))
+	default:
+		if block >= (uint64(1)<<48)-1 {
+			return 0, fmt.Errorf("chunk address exceeds 48-bit index range")
+		}
+		binary.LittleEndian.PutUint16(b[:2], uint16(block>>32))
+		binary.LittleEndian.PutUint16(b[2:4], device)
+		binary.LittleEndian.PutUint32(b[4:], uint32(block))
+	}
+	n, err := out.Write(b[:w.chunkIndexSize()])
+	if err == nil && n != w.chunkIndexSize() {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }
 
 // writeDirents writes EROFS directory entries packed into block-sized chunks.
