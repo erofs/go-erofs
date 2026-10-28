@@ -4,13 +4,19 @@ const (
 	MagicNumber      = 0xe0f5e1e2
 	SuperBlockOffset = 1024
 
+	// FeatureIncompat* bits track upstream Linux's fs/erofs/erofs_fs.h.
+	// Several positions are shared by two named features.
 	FeatureIncompatLZ4_0Padding         = 0x1
 	FeatureIncompatChunkedFile          = 0x4
 	FeatureIncompatDeviceTable          = 0x8
+	FeatureIncompatComprHead2           = 0x8 // shared bit with DeviceTable
+	FeatureIncompatZTailPacking         = 0x10
 	FeatureIncompatFragments            = 0x20
+	FeatureIncompatDedupe               = 0x20 // shared bit with Fragments
 	FeatureIncompatXattrPrefixes        = 0x40
 	FeatureIncompatAll           uint32 = FeatureIncompatLZ4_0Padding |
 		FeatureIncompatChunkedFile | FeatureIncompatDeviceTable |
+		FeatureIncompatZTailPacking |
 		FeatureIncompatFragments | FeatureIncompatXattrPrefixes
 
 	SizeSuperBlock      = 128
