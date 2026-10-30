@@ -1,10 +1,12 @@
 package erofs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"math/bits"
 	"os"
 	"path"
@@ -22,6 +24,7 @@ import (
 // Files are added via Create, Mkdir, Symlink, and Mknod, then finalized
 // by calling Close which serializes the complete EROFS image.
 type Writer struct {
+	ctx          context.Context
 	out          io.WriteSeeker
 	closed       bool
 	blockSize    int    // 0 = unset, resolved to defaultBlockSize in Close
@@ -31,6 +34,10 @@ type Writer struct {
 	wErr         error               // sticky error: once set, all subsequent ops return it
 	root         *fsEntry            // root directory
 	byPath       map[string]*fsEntry // path → entry (all types)
+
+	uuid            [16]byte
+	deviceAlignment uint32
+	mappedDevices   bool
 
 	devices []uint64 // per-device block counts (one per MetadataOnly source)
 
@@ -70,7 +77,7 @@ type CopyOpt func(*Writer)
 // Create returns a Writer that produces an EROFS image on Close.
 // Options configure build time, data file, and temp directory.
 func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
-	var o createOptions
+	o := createOptions{ctx: context.Background()}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -80,15 +87,19 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		ino:  &fsInode{mode: disk.StatTypeDir | 0o755},
 	}
 	fsys := &Writer{
-		out:          out,
-		buildTime:    o.buildTime,
-		buildTimeNs:  o.buildTimeNs,
-		hasBuildTime: o.hasBuildTime,
-		root:         root,
-		byPath:       map[string]*fsEntry{"/": root},
-		dataFile:     o.dataFile,
-		tempDir:      o.tempDir,
-		noInlineData: o.noInlineData,
+		ctx:             o.ctx,
+		out:             out,
+		buildTime:       o.buildTime,
+		buildTimeNs:     o.buildTimeNs,
+		hasBuildTime:    o.hasBuildTime,
+		root:            root,
+		byPath:          map[string]*fsEntry{"/": root},
+		dataFile:        o.dataFile,
+		tempDir:         o.tempDir,
+		noInlineData:    o.noInlineData,
+		uuid:            o.uuid,
+		deviceAlignment: o.deviceAlignment,
+		mappedDevices:   o.mappedDevices,
 	}
 
 	if o.blockSize != 0 {
@@ -182,6 +193,34 @@ func WithNoInlineData() CreateOpt {
 	return func(o *createOptions) {
 		o.noInlineData = true
 	}
+}
+
+// WithContext allows cancellation while importing filesystem entries.
+func WithContext(ctx context.Context) CreateOpt {
+	return func(o *createOptions) {
+		if ctx != nil {
+			o.ctx = ctx
+		}
+	}
+}
+
+// WithUUID sets the filesystem UUID.
+func WithUUID(uuid [16]byte) CreateOpt {
+	return func(o *createOptions) { o.uuid = uuid }
+}
+
+// WithDeviceAlignment rounds the primary device size up to a multiple of
+// blocks. The alignment is recorded in the superblock, not merely appended
+// after the addressable filesystem.
+func WithDeviceAlignment(blocks uint32) CreateOpt {
+	return func(o *createOptions) { o.deviceAlignment = blocks }
+}
+
+// WithMappedDevices assigns consecutive mapped addresses to extra devices.
+// Appending those devices, in order, to the output creates a single image
+// that can be mounted without separate device= options.
+func WithMappedDevices() CreateOpt {
+	return func(o *createOptions) { o.mappedDevices = true }
 }
 
 // --- Writer entry methods ---
@@ -416,10 +455,21 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			fsys.buildTime = srcImg.buildTime()
 			fsys.hasBuildTime = true
 		}
-		if fsys.copyMetadataOnly {
+		if fsys.copyMetadataOnly && len(srcImg.devices) == 0 {
+			if len(fsys.devices) >= math.MaxUint16 {
+				return fmt.Errorf("too many EROFS devices")
+			}
+			fsys.devices = append(fsys.devices, uint64(srcImg.sb.Blocks))
+			fsys.copyDeviceID = uint16(len(fsys.devices))
+		} else if fsys.copyMetadataOnly {
 			devBlocks := srcImg.deviceBlocks()
 			fsys.devices = append(fsys.devices, devBlocks...)
 			fsys.copyDeviceID = uint16(len(fsys.devices) - len(devBlocks) + 1)
+			if fsys.copyMerge {
+				if err := fsys.removeLayerWhiteouts(srcImg); err != nil {
+					return err
+				}
+			}
 			return fsys.copyFromImage(srcImg, hardlinks)
 		}
 	}
@@ -438,7 +488,15 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 		fsys.buildTime = bt.BuildTime()
 		fsys.hasBuildTime = true
 	}
-	return fs.WalkDir(src, ".", func(fpath string, d fs.DirEntry, err error) error {
+	if fsys.copyMerge {
+		if err := fsys.removeLayerWhiteouts(src); err != nil {
+			return err
+		}
+	}
+	return walkLayerSource(src, func(fpath string, d fs.DirEntry, err error) error {
+		if err := fsys.ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return err
 		}
@@ -454,20 +512,8 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			p = "/"
 		}
 
-		// Merge mode: process whiteout markers.
-		if fsys.copyMerge && p != "/" {
-			base := path.Base(p)
-			if strings.HasPrefix(base, whiteoutPrefix) {
-				if base == opaqueWhiteout {
-					// Opaque directory: remove all prior children of parent.
-					fsys.removeChildren(path.Dir(p))
-				} else {
-					// File whiteout: remove the named entry.
-					target := path.Join(path.Dir(p), base[len(whiteoutPrefix):])
-					fsys.remove(target)
-				}
-				return nil
-			}
+		if fsys.copyMerge && isLayerWhiteout(p, info) {
+			return nil
 		}
 
 		// Extract extended metadata from Sys().
@@ -492,6 +538,10 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 			}
 		}
 
+		if fsys.copyMerge && be != nil {
+			be = cloneWithoutOverlayXattrs(be)
+		}
+
 		// For regular files, get a data reader.
 		if info.Mode().IsRegular() && info.Size() > 0 && (be == nil || be.Data == nil) {
 			// In metadata-only mode, data is referenced via chunk indexes
@@ -509,6 +559,9 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 						if ranges := dr.DataRange(); len(ranges) > 0 {
 							chunks, err := fsys.chunksFromRanges(ranges, info.Size())
 							if err != nil {
+								if img, ok := src.(*image); ok && img.devices == nil {
+									return fsys.copyLocalImageFile(img, fpath, p, info, be, hardlinks)
+								}
 								return fmt.Errorf("chunksFromRanges %s: %w", p, err)
 							}
 							be.Chunks = chunks
@@ -518,6 +571,12 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 							be.Contiguous = len(ranges) == 1 && ranges[0].Offset != holeOffset
 						}
 					}
+				}
+				if len(be.Chunks) != 0 {
+					return fsys.add(p, &entryFileInfo{info: info, sys: be}, hardlinks)
+				}
+				if _, ok := src.(*image); ok {
+					return fmt.Errorf("metadata-only file %s has no data mapping: %w", p, ErrNotImplemented)
 				}
 				return fsys.add(p, &entryFileInfo{info: info, sys: be}, hardlinks)
 			}
@@ -631,13 +690,16 @@ func (fsys *Writer) Close() error {
 	}
 
 	ew := &erofsWriter{
-		buildTime:    buildTime,
-		buildTimeNs:  fsys.buildTimeNs,
-		devices:      fsys.devices,
-		blockSize:    fsys.blockSize,
-		chunkBits:    chunkBits,
-		noInlineData: fsys.noInlineData,
-		zeroBuf:      make([]byte, fsys.blockSize),
+		buildTime:       buildTime,
+		buildTimeNs:     fsys.buildTimeNs,
+		devices:         fsys.devices,
+		blockSize:       fsys.blockSize,
+		chunkBits:       chunkBits,
+		noInlineData:    fsys.noInlineData,
+		uuid:            fsys.uuid,
+		deviceAlignment: fsys.deviceAlignment,
+		mappedDevices:   fsys.mappedDevices,
+		zeroBuf:         make([]byte, fsys.blockSize),
 	}
 
 	ew.planLayout(root)
@@ -966,13 +1028,17 @@ type hardlinkKey struct {
 
 // createOptions holds the parsed option values for Create.
 type createOptions struct {
-	buildTime    uint64
-	buildTimeNs  uint32
-	hasBuildTime bool
-	blockSize    int      // 0 = use default
-	dataFile     *os.File // external data file for metadata-only mode
-	tempDir      string   // temp directory for spool file
-	noInlineData bool     // disable tail-packing for regular files
+	ctx             context.Context
+	uuid            [16]byte
+	deviceAlignment uint32
+	mappedDevices   bool
+	buildTime       uint64
+	buildTimeNs     uint32
+	hasBuildTime    bool
+	blockSize       int      // 0 = use default
+	dataFile        *os.File // external data file for metadata-only mode
+	tempDir         string   // temp directory for spool file
+	noInlineData    bool     // disable tail-packing for regular files
 }
 
 // blockSizer may be implemented by an fs.FS to declare its block size.
@@ -1373,6 +1439,9 @@ func (fsys *Writer) add(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*f
 
 	// Handle duplicate paths (overwrite semantics).
 	if existing, ok := fsys.byPath[p]; ok {
+		if existing.ino.mode&disk.StatTypeMask == disk.StatTypeDir && typ != disk.StatTypeDir {
+			fsys.removeSubtree(existing)
+		}
 		// Detach the old fsInode before replacing it so that any hard-linked
 		// names that still reference it get a correct nlink.
 		if existing.ino != ino {
@@ -1428,8 +1497,23 @@ func (fsys *Writer) add(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*f
 			if err := f.Close(); err != nil {
 				return err
 			}
+		} else if closer, ok := be.Data.(io.Closer); ok {
+			// Directory walks must not retain one open descriptor per file.
+			defer closer.Close()
+			if err := fsys.ensureSpool(); err != nil {
+				return err
+			}
+			ino.spoolOff = fsys.spoolOff
+			ino.dataStartOff = fsys.spoolOff
+			f := &File{fs: fsys, entry: fe, dataStartOff: fsys.spoolOff}
+			if _, err := f.ReadFrom(be.Data); err != nil {
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
 		} else {
-			// Spool mode: keep a direct reference to avoid copying.
+			// SectionReaders into an already-open source image need no copy.
 			ino.directData = be.Data
 			ino.fileClosed = true
 		}

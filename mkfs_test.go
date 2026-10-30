@@ -3509,7 +3509,7 @@ func TestCopyFromImageHardlinksMetadataOnly(t *testing.T) {
 	}
 	defer func() { _ = dfRead.Close() }()
 
-	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()), erofs.WithExtraDevices(dfRead))
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()), erofs.WithExtraDevices(dfRead, bytes.NewReader(srcBytes)))
 	if err != nil {
 		t.Fatal(err)
 	}

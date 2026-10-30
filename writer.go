@@ -25,19 +25,22 @@ type onlyWriter struct{ io.Writer }
 
 // erofsWriter serializes EROFS metadata to an io.Writer.
 type erofsWriter struct {
-	entries      []*erofsEntry // all entries in NID order
-	rootNid      uint64
-	metaBlkAddr  uint32
-	totalInodes  uint64
-	buildTime    uint64
-	buildTimeNs  uint32
-	devices      []uint64 // per-device block counts (one slot per entry)
-	blockSize    int
-	chunkBits    uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
-	noInlineData bool                         // disable tail-packing for regular files
-	copyBuf      []byte                       // reusable buffer for io.CopyBuffer
-	zeroBuf      []byte                       // blockSize-length zero buffer for padding
-	inodeBuf     [disk.SizeInodeExtended]byte // scratch buffer for writeInode
+	uuid            [16]byte
+	deviceAlignment uint32
+	mappedDevices   bool
+	entries         []*erofsEntry // all entries in NID order
+	rootNid         uint64
+	metaBlkAddr     uint32
+	totalInodes     uint64
+	buildTime       uint64
+	buildTimeNs     uint32
+	devices         []uint64 // per-device block counts (one slot per entry)
+	blockSize       int
+	chunkBits       uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
+	noInlineData    bool                         // disable tail-packing for regular files
+	copyBuf         []byte                       // reusable buffer for io.CopyBuffer
+	zeroBuf         []byte                       // blockSize-length zero buffer for padding
+	inodeBuf        [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 }
 
 // inodeSize returns the on-disk inode header size for e.
@@ -104,6 +107,24 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 	}
 	if _, err := meta.WriteTo(out); err != nil {
 		return err
+	}
+
+	// Filesystem alignment must be included in both the file and superblock.
+	if w.deviceAlignment > 1 {
+		pos, err := out.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		unit := int64(w.deviceAlignment) * int64(w.blockSize)
+		padding := (unit - pos%unit) % unit
+		for padding > 0 {
+			n := min(padding, int64(len(w.copyBuf)))
+			clear(w.copyBuf[:n])
+			if _, err := out.Write(w.copyBuf[:n]); err != nil {
+				return err
+			}
+			padding -= n
+		}
 	}
 
 	// Seek back and write the real block 0 (superblock).
@@ -239,7 +260,14 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 			dataBlocks += (ds + w.blockSize - 1) / w.blockSize
 		}
 	}
-	totalBlocks := w.sbAreaBlocks() + metaBlocks + dataBlocks
+	totalBlocks := uint64(w.sbAreaBlocks()) + uint64(metaBlocks) + uint64(dataBlocks)
+	if w.deviceAlignment > 1 {
+		a := uint64(w.deviceAlignment)
+		totalBlocks = (totalBlocks + a - 1) / a * a
+	}
+	if totalBlocks > math.MaxUint32 || len(w.devices) > math.MaxUint16 {
+		return fmt.Errorf("EROFS image exceeds 32-bit block or 16-bit device limits")
+	}
 
 	var featureIncompat uint32
 	var extraDevices uint16
@@ -248,7 +276,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	if len(w.devices) > 0 {
 		featureIncompat |= disk.FeatureIncompatDeviceTable
 		extraDevices = uint16(len(w.devices))
-		devtSlotOff = uint16(disk.SizeSuperBlock / 16)
+		devtSlotOff = uint16((disk.SuperBlockOffset + disk.SizeSuperBlock) / disk.SizeDeviceSlot)
 	}
 	for _, e := range w.entries {
 		if len(e.chunks) > 0 {
@@ -258,6 +286,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	}
 
 	sb := disk.SuperBlock{
+		UUID:            w.uuid,
 		MagicNumber:     disk.MagicNumber,
 		BlkSizeBits:     blkBits(w.blockSize),
 		RootNid:         uint16(w.rootNid),
@@ -278,12 +307,18 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	copy(sbArea[disk.SuperBlockOffset:], sbBuf.Bytes())
 
 	// Write device slots right after superblock.
+	mapped := totalBlocks
 	for i, blocks := range w.devices {
 		if blocks > math.MaxUint32 {
 			return fmt.Errorf("device %d block count %d exceeds 32-bit limit", i+1, blocks)
 		}
-		devSlot := disk.DeviceSlot{
-			Blocks: uint32(blocks),
+		devSlot := disk.DeviceSlot{Blocks: uint32(blocks)}
+		if w.mappedDevices {
+			if mapped > math.MaxUint32 || blocks > math.MaxUint32-mapped {
+				return fmt.Errorf("mapped device %d exceeds 32-bit address space", i+1)
+			}
+			devSlot.MappedBlkAddr = uint32(mapped)
+			mapped += blocks
 		}
 		devBuf := &bytes.Buffer{}
 		if err := binary.Write(devBuf, binary.LittleEndian, &devSlot); err != nil {

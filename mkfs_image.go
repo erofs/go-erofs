@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strings"
 
 	"github.com/erofs/go-erofs/internal/builder"
 	"github.com/erofs/go-erofs/internal/disk"
@@ -15,7 +16,9 @@ import (
 // outside the metadata region.
 func newMetaReader(ra io.ReaderAt, metaStart, totalBytes int64, blockSize int) func(int64) []byte {
 	metaSize := totalBytes - metaStart
-	if metaSize <= 0 {
+	// This optimization must not allocate an image-controlled filesystem size.
+	// Larger metadata regions use the bounded reader path instead.
+	if metaSize <= 0 || metaSize > 64<<20 {
 		return func(int64) []byte { return nil }
 	}
 	metaBuf := make([]byte, metaSize)
@@ -92,8 +95,8 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 		sharedXattrOff = int64(img.sb.XattrBlkAddr) << blkBits
 	}
 
-	// Pre-allocate based on inode count from superblock.
-	inodeCount := int(img.sb.Inos)
+	// Cap capacity hints from untrusted image metadata.
+	inodeCount := int(min(img.sb.Inos, 65536))
 	if inodeCount == 0 {
 		inodeCount = 64
 	}
@@ -104,21 +107,9 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 		cur := queue[0]
 		queue = queue[1:]
 
-		// Merge mode: process whiteout markers.
-		if fsys.copyMerge && cur.path != "/" {
-			base := path.Base(cur.path)
-			if len(base) > len(whiteoutPrefix) && base[:len(whiteoutPrefix)] == whiteoutPrefix {
-				if base == opaqueWhiteout {
-					fsys.removeChildren(path.Dir(cur.path))
-				} else {
-					target := path.Dir(cur.path) + "/" + base[len(whiteoutPrefix):]
-					if path.Dir(cur.path) == "/" {
-						target = "/" + base[len(whiteoutPrefix):]
-					}
-					fsys.remove(target)
-				}
-				continue
-			}
+		// The deletion pass ran before this layer was imported.
+		if fsys.copyMerge && cur.path != "/" && strings.HasPrefix(path.Base(cur.path), whiteoutPrefix) {
+			continue
 		}
 
 		inodeAddr := metaStart + int64(cur.nid*disk.SizeInodeCompact)
@@ -199,6 +190,16 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 
 		trailingAddr := inodeAddr + int64(icSize) + int64(xattrSize)
 		typ := mode & disk.StatTypeMask
+		if fsys.copyMerge && typ == disk.StatTypeChrdev && idata == 0 {
+			continue
+		}
+		if fsys.copyMerge {
+			for name := range xattrs {
+				if strings.HasPrefix(name, "trusted.overlay.") || strings.HasPrefix(name, "user.overlay.") {
+					delete(xattrs, name)
+				}
+			}
+		}
 
 		// Build fsInode directly, bypassing builder.Entry + add() overhead.
 		ino := &fsInode{
@@ -243,6 +244,9 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 		if !secondaryHardlink {
 			switch typ {
 			case disk.StatTypeDir:
+				if size > uint64(totalBytes) || size > 64<<20 {
+					return fmt.Errorf("directory size %d: %w", size, ErrInvalid)
+				}
 				dirSize := int(size)
 				if dirSize > 0 {
 					var dirData []byte
@@ -270,6 +274,9 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 				}
 
 			case disk.StatTypeSymlink:
+				if size > maxSymlinkSize {
+					return fmt.Errorf("symlink size %d: %w", size, ErrInvalid)
+				}
 				if size > 0 {
 					var linkData []byte
 					if layout == disk.LayoutFlatPlain {

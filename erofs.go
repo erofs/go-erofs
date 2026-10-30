@@ -198,7 +198,7 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 		i.deviceIDMask = uint16(roundupPowerOfTwo(uint32(i.sb.ExtraDevices)+1) - 1)
 	}
 
-	if int(ondiskExtraDevices) != len(o.extraDevices) {
+	if len(o.extraDevices) != 0 && int(ondiskExtraDevices) != len(o.extraDevices) {
 		// TODO: Provide options for skipping extra devices and error out later?
 		return nil, fmt.Errorf("invalid super block: extra devices count %d does not match provided %d", ondiskExtraDevices, len(o.extraDevices))
 	}
@@ -217,8 +217,19 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 			if _, err := binary.Decode(slotBuf[:], binary.LittleEndian, &slot); err != nil {
 				return nil, fmt.Errorf("failed to decode device slot %d: %w", idx, err)
 			}
+			var device io.ReaderAt
+			if len(o.extraDevices) != 0 {
+				device = o.extraDevices[idx]
+			} else {
+				if slot.MappedBlkAddr == 0 {
+					return nil, fmt.Errorf("extra device %d has no mapped address: %w", idx+1, ErrInvalidSuperblock)
+				}
+				start := int64(slot.MappedBlkAddr) << i.sb.BlkSizeBits
+				size := int64(slot.Blocks) << i.sb.BlkSizeBits
+				device = io.NewSectionReader(r, start, size)
+			}
 			i.devices[idx] = deviceInfo{
-				device:        o.extraDevices[idx],
+				device:        device,
 				mappedBlkAddr: slot.MappedBlkAddr,
 				blocks:        slot.Blocks,
 			}
