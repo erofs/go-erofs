@@ -47,7 +47,6 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 			continue // skip; NID assigned in second pass below
 		}
 
-		e.nid = uint64(currentOff / 32)
 		e.xattrSize = calcXattrSize(e)
 
 		// Decide compact (32B) vs extended (64B) inode.
@@ -55,93 +54,21 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 		e.compact = e.uid <= 0xFFFF && e.gid <= 0xFFFF &&
 			e.nlink <= 0xFFFF && e.size <= 0xFFFFFFFF && mtimeOK
 
-		inodeSize := disk.SizeInodeExtended
-		if e.compact {
-			inodeSize = disk.SizeInodeCompact
-		}
-
 		// The inode header region is inode core + xattr area.
 		// Trailing data (dirents, chunk indexes, inline data) follows.
-		headerSize := inodeSize + e.xattrSize
+		headerSize := inodeCoreSize(e) + e.xattrSize
 
-		// Determine layout
-		switch e.mode & disk.StatTypeMask {
-		case disk.StatTypeReg:
-			switch {
-			case e.size == 0 && len(e.chunks) == 0 && e.data == nil && !e.metadataOnly:
-				e.layout = disk.LayoutFlatPlain
-			case len(e.chunks) > 0 || e.metadataOnly:
-				e.layout = disk.LayoutChunkBased
-				if e.contiguous {
-					e.chunkBits = w.minChunkBits(e.size)
-				}
-			default:
-				// Full-image mode: decide inline vs plain
-				if !w.noInlineData && int(e.size) <= w.blockSize-headerSize {
-					inBlockOff := (currentOff + headerSize) % w.blockSize
-					if inBlockOff+int(e.size) <= w.blockSize {
-						e.layout = disk.LayoutFlatInline
-					} else {
-						e.layout = disk.LayoutFlatPlain
-					}
-				} else {
-					e.layout = disk.LayoutFlatPlain
-				}
-			}
-		case disk.StatTypeDir:
-			direntDataSize := w.direntDataSize(e)
-			inBlockOff := (currentOff + headerSize) % w.blockSize
-			if direntDataSize > 0 && inBlockOff+direntDataSize <= w.blockSize {
-				e.layout = disk.LayoutFlatInline
-			} else {
-				e.layout = disk.LayoutFlatPlain
-			}
-		case disk.StatTypeSymlink:
-			inBlockOff := (currentOff + headerSize) % w.blockSize
-			if len(e.symTarget) > 0 && inBlockOff+len(e.symTarget) <= w.blockSize {
-				e.layout = disk.LayoutFlatInline
-			} else {
-				e.layout = disk.LayoutFlatPlain
-			}
-		default:
-			// Device files, fifos, sockets
-			e.layout = disk.LayoutFlatPlain
+		e.layout = w.baseLayout(e)
+		inline := -1
+		if e.layout == disk.LayoutFlatPlain {
+			inline = w.inlineSize(e, headerSize)
 		}
+		currentOff = w.placeEntry(e, currentOff, headerSize, inline)
+		e.nid = uint64(currentOff / 32)
 
-		// Recalculate trailing size now that layout is decided
 		e.trailingSize = w.calcTrailingSize(e)
 		e.chunkPad = chunkIndexPad(e)
-
-		totalInodeSize := headerSize + e.chunkPad + e.trailingSize
-		// Pad to 32-byte boundary
-		if totalInodeSize%32 != 0 {
-			totalInodeSize = (totalInodeSize + 31) & ^31
-		}
-
-		// Check block boundary: inode core must not cross a block boundary
-		blockOff := currentOff % w.blockSize
-		if blockOff+inodeSize > w.blockSize {
-			// Align to next block
-			currentOff = (currentOff + w.blockSize - 1) & ^(w.blockSize - 1)
-			e.nid = uint64(currentOff / 32)
-		}
-
-		// Also check that trailing data doesn't cross block boundary for inline layouts
-		if e.layout == disk.LayoutFlatInline {
-			blockOff = currentOff % w.blockSize
-			if blockOff+headerSize+e.trailingSize > w.blockSize {
-				// Fall back to flat-plain (data would cross block boundary)
-				e.layout = disk.LayoutFlatPlain
-				e.trailingSize = w.calcTrailingSize(e)
-				e.chunkPad = chunkIndexPad(e)
-				totalInodeSize = headerSize + e.chunkPad + e.trailingSize
-				if totalInodeSize%32 != 0 {
-					totalInodeSize = (totalInodeSize + 31) & ^31
-				}
-			}
-		}
-
-		currentOff += totalInodeSize
+		currentOff += roundUp32(headerSize + e.chunkPad + e.trailingSize)
 	}
 
 	// Second pass: copy the primary's finalized NID to secondary entries.
@@ -152,6 +79,78 @@ func (w *erofsWriter) planLayout(root *erofsEntry) {
 	}
 
 	w.rootNid = root.nid
+}
+
+// baseLayout returns the layout of e before placement: chunk-based for
+// chunked or metadata-only files, flat-plain otherwise. placeEntry may
+// change a flat-plain layout to flat-inline.
+func (w *erofsWriter) baseLayout(e *erofsEntry) uint8 {
+	if e.mode&disk.StatTypeMask == disk.StatTypeReg && (len(e.chunks) > 0 || e.metadataOnly) {
+		if e.contiguous {
+			e.chunkBits = w.minChunkBits(e.size)
+		}
+		return disk.LayoutChunkBased
+	}
+	return disk.LayoutFlatPlain
+}
+
+// inlineSize returns the number of bytes e would store after its inode with
+// the flat-inline layout, or -1 if e cannot use it. For regular files this
+// is the part after the last full block. Inline data must not cross a block
+// boundary, so header and data must fit in one block.
+func (w *erofsWriter) inlineSize(e *erofsEntry, headerSize int) int {
+	n := -1
+	switch e.mode & disk.StatTypeMask {
+	case disk.StatTypeReg:
+		if !w.noInlineData && e.data != nil {
+			n = regInlineSize(e.size, w.blockSize)
+		}
+	case disk.StatTypeDir:
+		n = w.direntDataSize(e)
+	case disk.StatTypeSymlink:
+		n = len(e.symTarget)
+	}
+	if n <= 0 || headerSize+n > w.blockSize {
+		return -1
+	}
+	return n
+}
+
+// placeEntry returns the metadata offset for e, which needs headerSize bytes
+// plus inline bytes of inline data (-1 if none), and sets e.layout to
+// flat-inline when the data is stored inline. The current block is used if
+// everything fits. Otherwise the data is stored inline at the start of the
+// next block when the space left in the current block is no more than the
+// space a data block would waste, and in a data block of its own if not.
+// The inode core never crosses a block boundary.
+func (w *erofsWriter) placeEntry(e *erofsEntry, off, headerSize, inline int) int {
+	left := w.blockSize - off%w.blockSize
+	if inline >= 0 {
+		if headerSize+inline <= left {
+			e.layout = disk.LayoutFlatInline
+			return off
+		}
+		if left <= w.blockSize-inline {
+			e.layout = disk.LayoutFlatInline
+			return off + left
+		}
+	}
+	if inodeCoreSize(e) > left {
+		return off + left
+	}
+	return off
+}
+
+// regInlineSize returns the bytes of a regular file of the given size that
+// the flat-inline layout stores after the inode: the part after the last
+// full block. The full blocks are stored in data blocks.
+func regInlineSize(size uint64, blockSize int) int {
+	return int(size % uint64(blockSize))
+}
+
+// roundUp32 rounds n up to a multiple of 32, the inode slot size.
+func roundUp32(n int) int {
+	return (n + 31) &^ 31
 }
 
 // chunkIndexPad returns the padding inserted between an inode's xattr area and
@@ -187,7 +186,7 @@ func (w *erofsWriter) calcTrailingSize(e *erofsEntry) int {
 			return nchunks * disk.SizeChunkIndex
 		}
 		if e.layout == disk.LayoutFlatInline {
-			return int(e.size)
+			return regInlineSize(e.size, w.blockSize)
 		}
 		return 0
 	case disk.StatTypeDir:

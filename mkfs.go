@@ -529,7 +529,11 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 				if st, ok := info.Sys().(*Stat); ok {
 					f := file{img: srcImg, nid: uint64(st.Ino)}
 					if ino, err := f.readInfo(); err == nil {
-						if dr := srcImg.openDirect(ino); dr != nil {
+						dr := srcImg.openDirect(ino)
+						// Return the block readInfo cached for inline data;
+						// dr reads the image directly.
+						_ = f.Close()
+						if dr != nil {
 							if be == nil {
 								be = &builder.Entry{}
 							}
@@ -1067,6 +1071,10 @@ type erofsEntry struct {
 
 	// Data block address for flat-plain files (full-image mode)
 	dataBlkAddr uint32
+	// inlineTail holds the data after the last full block of a flat-inline
+	// regular file larger than a block, read while writing its data blocks
+	// and written with its inode.
+	inlineTail []byte
 }
 
 // --- Internal helpers ---

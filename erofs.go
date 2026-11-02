@@ -353,13 +353,15 @@ func (img *image) openDirect(ino *inode) io.Reader {
 		return io.NewSectionReader(img.meta, dataOffset, ino.size)
 	case disk.LayoutFlatInline:
 		// Last block is inline after the inode; earlier blocks at dataBlkAddr.
-		// Only use direct read for single-block files (all data inline).
-		if ino.size > blockSize {
-			return nil
-		}
 		inodeAddr := img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact
 		trailingAddr := inodeAddr + ino.flatDataOffset()
-		return io.NewSectionReader(img.meta, trailingAddr, ino.size)
+		if ino.size <= blockSize {
+			return io.NewSectionReader(img.meta, trailingAddr, ino.size)
+		}
+		headSize := ((ino.size - 1) / blockSize) * blockSize
+		return io.MultiReader(
+			io.NewSectionReader(img.meta, int64(ino.inodeData)<<img.sb.BlkSizeBits, headSize),
+			io.NewSectionReader(img.meta, trailingAddr, ino.size-headSize))
 	case disk.LayoutChunkBased:
 		// Chunk-based files store data at the physical block addresses
 		// listed in the chunk index. For contiguous single-device files,

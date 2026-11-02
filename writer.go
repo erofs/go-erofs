@@ -1,6 +1,7 @@
 package erofs
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -36,6 +37,7 @@ type erofsWriter struct {
 	chunkBits    uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
 	noInlineData bool                         // disable tail-packing for regular files
 	copyBuf      []byte                       // reusable buffer for io.CopyBuffer
+	tailArena    []byte                       // backing store for inline tails, see tailBuf
 	zeroBuf      []byte                       // blockSize-length zero buffer for padding
 	inodeBuf     [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 }
@@ -97,12 +99,12 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 		return err
 	}
 
-	// Buffer and write metadata.
-	meta := w.newMetaBuffer()
+	// Write metadata through a fixed-size buffer.
+	meta := bufio.NewWriterSize(out, metaBufferSize)
 	if err := w.writeMetadataInodes(meta); err != nil {
 		return err
 	}
-	if _, err := meta.WriteTo(out); err != nil {
+	if err := meta.Flush(); err != nil {
 		return err
 	}
 
@@ -113,28 +115,8 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 	return w.writeBlock0(out)
 }
 
-// newMetaBuffer returns a pre-sized bytes.Buffer for metadata serialization.
-func (w *erofsWriter) newMetaBuffer() *bytes.Buffer {
-	totalMetaBytes := 0
-	for _, e := range w.entries {
-		if e.hardLinkPrimary != nil {
-			continue // secondary entries share the primary's on-disk inode
-		}
-		isz := disk.SizeInodeExtended
-		if e.compact {
-			isz = disk.SizeInodeCompact
-		}
-		sz := isz + e.xattrSize + e.chunkPad + e.trailingSize
-		if sz%32 != 0 {
-			sz = (sz + 31) & ^31
-		}
-		totalMetaBytes += sz
-	}
-	// SB area + metadata padded to block boundary.
-	capacity := w.blockSize + ((totalMetaBytes + w.blockSize - 1) & ^(w.blockSize - 1))
-	buf := bytes.NewBuffer(make([]byte, 0, capacity))
-	return buf
-}
+// metaBufferSize is the size of the buffer metadata is written through.
+const metaBufferSize = 256 << 10
 
 // assignDataBlocks assigns data block addresses to flat-plain entries.
 // For metadata-first layout, data follows metadata.
@@ -164,7 +146,7 @@ func (w *erofsWriter) assignDataBlocks() {
 			if e.hardLinkPrimary != nil {
 				continue
 			}
-			if ds := w.flatPlainDataSize(e); ds > 0 {
+			if ds := w.dataAreaSize(e); ds > 0 {
 				e.dataBlkAddr = addr
 				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
 			}
@@ -176,7 +158,7 @@ func (w *erofsWriter) assignDataBlocks() {
 			if e.hardLinkPrimary != nil {
 				continue // secondary entries share the primary's data blocks
 			}
-			if ds := w.flatPlainDataSize(e); ds > 0 {
+			if ds := w.dataAreaSize(e); ds > 0 {
 				e.dataBlkAddr = addr
 				addr += uint32((ds + w.blockSize - 1) / w.blockSize)
 			}
@@ -235,7 +217,7 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		if e.hardLinkPrimary != nil {
 			continue
 		}
-		if ds := w.flatPlainDataSize(e); ds > 0 {
+		if ds := w.dataAreaSize(e); ds > 0 {
 			dataBlocks += (ds + w.blockSize - 1) / w.blockSize
 		}
 	}
@@ -335,7 +317,8 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 		// Write trailing data
 		switch e.mode & disk.StatTypeMask {
 		case disk.StatTypeReg:
-			if e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0) {
+			switch {
+			case e.layout == disk.LayoutChunkBased && (e.size > 0 || len(e.chunks) > 0):
 				// Align the chunk-index map to the chunk-index unit.
 				if e.chunkPad > 0 {
 					if _, err := buf.Write(w.zeroBuf[:e.chunkPad]); err != nil {
@@ -347,7 +330,13 @@ func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 					return fmt.Errorf("write chunks for %s: %w", e.path, err)
 				}
 				metaStart += e.trailingSize
-			} else if e.layout == disk.LayoutFlatInline && e.size > 0 && e.data != nil {
+			case e.inlineTail != nil:
+				if _, err := buf.Write(e.inlineTail); err != nil {
+					return fmt.Errorf("write inline data for %s: %w", e.path, err)
+				}
+				metaStart += len(e.inlineTail)
+				e.inlineTail = nil
+			case e.layout == disk.LayoutFlatInline && e.size > 0 && e.data != nil:
 				// e.data may be an unbounded reader (e.g. directData from CopyFrom);
 				// limit to e.size bytes to prevent overwriting subsequent metadata.
 				expected := int64(e.size)
@@ -413,7 +402,7 @@ func (w *erofsWriter) writeInode(buf io.Writer, e *erofsEntry) error {
 	case disk.StatTypeReg:
 		if e.layout == disk.LayoutChunkBased {
 			inodeData = disk.LayoutChunkFormatIndexes | uint32(w.entryChunkBits(e))
-		} else if e.layout == disk.LayoutFlatPlain && e.size > 0 {
+		} else if w.dataAreaSize(e) > 0 {
 			inodeData = e.dataBlkAddr
 		}
 	case disk.StatTypeDir, disk.StatTypeSymlink:
@@ -659,7 +648,7 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 		if e.hardLinkPrimary != nil {
 			continue // secondary hard-link entries share the primary's data blocks
 		}
-		ds := w.flatPlainDataSize(e)
+		ds := w.dataAreaSize(e)
 		if ds == 0 {
 			continue
 		}
@@ -676,6 +665,11 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 				written, err = io.Copy(out, limited)
 			} else {
 				written, err = io.CopyBuffer(onlyWriter{out}, limited, w.copyBuf)
+			}
+			if err == nil && written == expected && e.layout == disk.LayoutFlatInline {
+				// Keep the rest for the inline data written with the metadata.
+				e.inlineTail = w.tailBuf(regInlineSize(e.size, w.blockSize))
+				_, err = io.ReadFull(e.data, e.inlineTail)
 			}
 			if c, ok := e.data.(io.Closer); ok {
 				_ = c.Close()
@@ -711,8 +705,24 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 	return nil
 }
 
-// flatPlainDataSize returns the data size for a flat-plain entry, or 0.
-func (w *erofsWriter) flatPlainDataSize(e *erofsEntry) int {
+// tailBuf returns an n-byte buffer for the inline tail of a file. Tails
+// are carved from shared 64 KiB arenas to avoid an allocation per file.
+func (w *erofsWriter) tailBuf(n int) []byte {
+	if cap(w.tailArena)-len(w.tailArena) < n {
+		w.tailArena = make([]byte, 0, max(n, 64<<10))
+	}
+	start := len(w.tailArena)
+	w.tailArena = w.tailArena[:start+n]
+	return w.tailArena[start : start+n : start+n]
+}
+
+// dataAreaSize returns the number of bytes e stores in data blocks: all of
+// its data with the flat-plain layout, the full blocks of a regular file
+// with the flat-inline layout, or 0.
+func (w *erofsWriter) dataAreaSize(e *erofsEntry) int {
+	if e.layout == disk.LayoutFlatInline && e.mode&disk.StatTypeMask == disk.StatTypeReg {
+		return int(e.size) - regInlineSize(e.size, w.blockSize)
+	}
 	if e.layout != disk.LayoutFlatPlain {
 		return 0
 	}
