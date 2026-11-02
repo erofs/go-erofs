@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"math/bits"
 	"os"
 	"path"
@@ -28,6 +29,7 @@ type Writer struct {
 	buildTime    uint64 // from WithBuildTime or buildTimer
 	buildTimeNs  uint32
 	hasBuildTime bool
+	allow48Bit   bool
 	wErr         error               // sticky error: once set, all subsequent ops return it
 	root         *fsEntry            // root directory
 	byPath       map[string]*fsEntry // path → entry (all types)
@@ -84,6 +86,7 @@ func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
 		buildTime:    o.buildTime,
 		buildTimeNs:  o.buildTimeNs,
 		hasBuildTime: o.hasBuildTime,
+		allow48Bit:   o.allow48Bit,
 		root:         root,
 		byPath:       map[string]*fsEntry{"/": root},
 		dataFile:     o.dataFile,
@@ -157,6 +160,22 @@ func WithBuildTime(sec uint64, nsec uint32) CreateOpt {
 		o.buildTime = sec
 		o.buildTimeNs = nsec
 		o.hasBuildTime = true
+	}
+}
+
+// With48Bit allows Close to use the 48-bit layout (the INCOMPAT_48BIT
+// feature, as mkfs.erofs -E48bit). In that layout a compact inode stores its
+// mtime as an offset from the superblock time instead of being limited to
+// the build time, so most entries can use compact (32-byte) inodes.
+//
+// The layout is used only when it makes more inodes compact; otherwise the
+// image is written as without this option. Images that use it need Linux
+// 6.15 or later; older kernels refuse to mount them. With WithBuildTime, the
+// build time is kept and entries up to 2^32-1 seconds older than it can be
+// compact.
+func With48Bit() CreateOpt {
+	return func(o *createOptions) {
+		o.allow48Bit = true
 	}
 }
 
@@ -620,15 +639,40 @@ func (fsys *Writer) Close() error {
 	}
 
 	// Build erofsEntry tree from the fsEntry tree via BFS.
+	// With48Bit also needs the mtime counts to decide whether the 48-bit
+	// layout makes more inodes compact.
+	var counts *mostCommonMtime
 	var policy mtimePolicy
-	if !fsys.hasBuildTime {
-		policy = newMostCommonMtime()
+	if !fsys.hasBuildTime || fsys.allow48Bit {
+		counts = newMostCommonMtime()
+		policy = counts
 	}
 	root := fsys.buildErofsTree(policy)
 
 	buildTime, buildTimeNs := fsys.buildTime, fsys.buildTimeNs
-	if policy != nil {
-		buildTime, buildTimeNs = policy.result()
+	if !fsys.hasBuildTime {
+		buildTime, buildTimeNs = counts.result()
+	}
+	var format48Bit bool
+	var buildTimeOffset uint32
+	if fsys.allow48Bit && buildTimeNs == 0 {
+		// Compact inodes need the build time's nanoseconds, which the
+		// counts only cover for 0.
+		compact := counts.count(buildTime)
+		epoch := buildTime - min(buildTime, math.MaxUint32)
+		if !fsys.hasBuildTime {
+			// No build time to keep: start the window at the earliest mtime.
+			epoch = counts.earliest()
+		}
+		// Compact inodes can hold any offset up to 2^32-1 from the epoch.
+		end := epoch + min(math.MaxUint64-epoch, math.MaxUint32)
+		if counts.countRange(epoch, end) > compact {
+			format48Bit = true
+			if fsys.hasBuildTime {
+				buildTimeOffset = uint32(buildTime - epoch)
+			}
+			buildTime = epoch
+		}
 	}
 
 	var chunkBits uint8
@@ -637,13 +681,15 @@ func (fsys *Writer) Close() error {
 	}
 
 	ew := &erofsWriter{
-		buildTime:    buildTime,
-		buildTimeNs:  buildTimeNs,
-		devices:      fsys.devices,
-		blockSize:    fsys.blockSize,
-		chunkBits:    chunkBits,
-		noInlineData: fsys.noInlineData,
-		zeroBuf:      make([]byte, fsys.blockSize),
+		buildTime:       buildTime,
+		buildTimeNs:     buildTimeNs,
+		format48Bit:     format48Bit,
+		buildTimeOffset: buildTimeOffset,
+		devices:         fsys.devices,
+		blockSize:       fsys.blockSize,
+		chunkBits:       chunkBits,
+		noInlineData:    fsys.noInlineData,
+		zeroBuf:         make([]byte, fsys.blockSize),
 	}
 
 	ew.planLayout(root)
@@ -975,6 +1021,7 @@ type createOptions struct {
 	buildTime    uint64
 	buildTimeNs  uint32
 	hasBuildTime bool
+	allow48Bit   bool
 	blockSize    int      // 0 = use default
 	dataFile     *os.File // external data file for metadata-only mode
 	tempDir      string   // temp directory for spool file
@@ -1545,11 +1592,11 @@ func unlinkInode(ino *fsInode) {
 
 // buildErofsTree converts the fsEntry tree into an erofsEntry tree via BFS.
 // Children are sorted for deterministic output. The Writer is consumed.
-// If policy is non-nil, it observes the mtime of each inode written, once
-// per inode.
+// If policy is non-nil, it observes the mtime of each inode written that
+// could otherwise use a compact inode, once per inode.
 func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 	countMtime := func(e *erofsEntry) {
-		if policy != nil && e.hardLinkPrimary == nil {
+		if policy != nil && e.hardLinkPrimary == nil && compactFields(e) {
 			policy.observe(e.mtime, e.mtimeNs)
 		}
 	}
@@ -1566,7 +1613,6 @@ func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 	seen := make(map[*fsInode]*erofsEntry)
 
 	rootEr := fsys.fsToErofs(fsys.root)
-	countMtime(rootEr)
 	queue := []pair{{fsys.root, rootEr}}
 
 	for len(queue) > 0 {
@@ -1576,6 +1622,8 @@ func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 		if !cur.fs.ino.nlinkSet && cur.fs.ino.mode&disk.StatTypeMask == disk.StatTypeDir {
 			cur.er.nlink = entryNlink(cur.fs)
 		}
+		// Directories are counted here, once their nlink is final.
+		countMtime(cur.er)
 
 		// Convert and enqueue children.
 		if len(cur.fs.children) > 0 {
@@ -1597,7 +1645,9 @@ func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 					seen[c.ino] = ent
 				}
 			}
-			countMtime(ent)
+			if c.ino.mode&disk.StatTypeMask != disk.StatTypeDir {
+				countMtime(ent)
+			}
 
 			cur.er.children = append(cur.er.children, ent)
 			if c.ino.mode&disk.StatTypeMask == disk.StatTypeDir {

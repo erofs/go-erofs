@@ -25,19 +25,24 @@ type onlyWriter struct{ io.Writer }
 
 // erofsWriter serializes EROFS metadata to an io.Writer.
 type erofsWriter struct {
-	entries      []*erofsEntry // all entries in NID order
-	rootNid      uint64
-	metaBlkAddr  uint32
-	totalInodes  uint64
-	buildTime    uint64
-	buildTimeNs  uint32
-	devices      []uint64 // per-device block counts (one slot per entry)
-	blockSize    int
-	chunkBits    uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
-	noInlineData bool                         // disable tail-packing for regular files
-	copyBuf      []byte                       // reusable buffer for io.CopyBuffer
-	zeroBuf      []byte                       // blockSize-length zero buffer for padding
-	inodeBuf     [disk.SizeInodeExtended]byte // scratch buffer for writeInode
+	entries     []*erofsEntry // all entries in NID order
+	rootNid     uint64
+	metaBlkAddr uint32
+	totalInodes uint64
+	buildTime   uint64 // superblock timestamp for compact inode mtimes
+	buildTimeNs uint32
+	// format48Bit selects the 48-bit layout, where compact inodes store
+	// their mtime as an offset from buildTime and the build time itself is
+	// buildTime + buildTimeOffset.
+	format48Bit     bool
+	buildTimeOffset uint32
+	devices         []uint64 // per-device block counts (one slot per entry)
+	blockSize       int
+	chunkBits       uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
+	noInlineData    bool                         // disable tail-packing for regular files
+	copyBuf         []byte                       // reusable buffer for io.CopyBuffer
+	zeroBuf         []byte                       // blockSize-length zero buffer for padding
+	inodeBuf        [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 }
 
 // inodeSize returns the on-disk inode header size for e.
@@ -260,7 +265,6 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 	sb := disk.SuperBlock{
 		MagicNumber:     disk.MagicNumber,
 		BlkSizeBits:     blkBits(w.blockSize),
-		RootNid:         uint16(w.rootNid),
 		Inos:            w.totalInodes,
 		BuildTime:       w.buildTime,
 		BuildTimeNs:     w.buildTimeNs,
@@ -269,6 +273,14 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 		FeatureIncompat: featureIncompat,
 		ExtraDevices:    extraDevices,
 		DevtSlotOff:     devtSlotOff,
+	}
+	if w.format48Bit {
+		sb.FeatureCompat |= disk.FeatureCompatMtime
+		sb.FeatureIncompat |= disk.FeatureIncompat48Bit
+		sb.RootNid8B = w.rootNid
+		sb.BuildTimeOffset = w.buildTimeOffset
+	} else {
+		sb.RootNid = uint16(w.rootNid)
 	}
 
 	sbBuf := &bytes.Buffer{}

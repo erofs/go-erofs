@@ -76,8 +76,6 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 	}
 
 	blkBits := img.sb.BlkSizeBits
-	buildTime := img.sb.BuildTime
-	buildTimeNs := img.sb.BuildTimeNs
 
 	blockSize := int(1 << blkBits)
 
@@ -98,7 +96,7 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 		inodeCount = 64
 	}
 	queue := make([]imgQEntry, 0, inodeCount)
-	queue = append(queue, imgQEntry{nid: uint64(img.sb.RootNid), path: "/"})
+	queue = append(queue, imgQEntry{nid: img.rootNid, path: "/"})
 
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -156,20 +154,25 @@ func (fsys *Writer) copyFromImage(img *image, hardlinks map[hardlinkKey]*fsInode
 			if _, err := binary.Decode(buf[:disk.SizeInodeCompact], binary.LittleEndian, &ino); err != nil {
 				return fmt.Errorf("decode compact inode %d: %w", cur.nid, err)
 			}
+			var err error
+			if nlink, err = compactNlink(format, ino.Mode, ino.Nlink, ino.InodeData); err != nil {
+				return fmt.Errorf("compact inode %d: %w", cur.nid, err)
+			}
 			mode = ino.Mode
 			uid = uint32(ino.UID)
 			gid = uint32(ino.GID)
-			nlink = uint32(ino.Nlink)
 			size = uint64(ino.Size)
 			idata = ino.InodeData
-			mtime = buildTime
-			mtimeNs = buildTimeNs
+			mtime, mtimeNs = img.compactMtime(ino.Mtime)
 			xcnt = ino.XattrCount
 			icSize = disk.SizeInodeCompact
 		} else {
 			var ino disk.InodeExtended
 			if _, err := binary.Decode(buf[:disk.SizeInodeExtended], binary.LittleEndian, &ino); err != nil {
 				return fmt.Errorf("decode extended inode %d: %w", cur.nid, err)
+			}
+			if err := checkStartBlkHi(ino.Mode, ino.StartBlkHi, ino.InodeData); err != nil {
+				return fmt.Errorf("extended inode %d: %w", cur.nid, err)
 			}
 			mode = ino.Mode
 			uid = ino.UID
