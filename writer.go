@@ -36,6 +36,9 @@ type erofsWriter struct {
 	chunkBits    uint8                        // log2(chunkSize / blockSize); chunkSize = blockSize << chunkBits
 	noInlineData bool                         // disable tail-packing for regular files
 	copyBuf      []byte                       // reusable buffer for io.CopyBuffer
+	progress     *progressCounters            // see Writer.Progress
+	done         int64                        // entries written so far, including the root
+	dataDone     int64                        // file data bytes written so far
 	zeroBuf      []byte                       // blockSize-length zero buffer for padding
 	inodeBuf     [disk.SizeInodeExtended]byte // scratch buffer for writeInode
 }
@@ -110,7 +113,30 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 	if _, err := out.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	return w.writeBlock0(out)
+	if err := w.writeBlock0(out); err != nil {
+		return err
+	}
+	w.progress.dataBytesWritten.Store(w.dataDone)
+	w.progress.entriesWritten.Store(int64(len(w.entries) - 1))
+	return nil
+}
+
+// entryDone counts one more entry as written and, if publish is set,
+// updates the count reported by Writer.Progress. Each entry is counted once:
+// in writeDataBlocks if it has data blocks, otherwise in writeMetadataInodes.
+// The reported count excludes the root and stays below the total until
+// writeSeekable has written the superblock.
+func (w *erofsWriter) entryDone(publish bool) {
+	w.done++
+	if publish {
+		w.progress.entriesWritten.Store(max(min(w.done-1, int64(len(w.entries)-2)), 0))
+		w.progress.dataBytesWritten.Store(w.dataDone)
+	}
+}
+
+// hasDataBlocks reports whether writeDataBlocks writes data for e.
+func (w *erofsWriter) hasDataBlocks(e *erofsEntry) bool {
+	return e.hardLinkPrimary == nil && w.flatPlainDataSize(e) > 0
 }
 
 // newMetaBuffer returns a pre-sized bytes.Buffer for metadata serialization.
@@ -302,6 +328,17 @@ func (w *erofsWriter) writeBlock0(buf io.Writer) error {
 func (w *erofsWriter) writeMetadataInodes(buf io.Writer) error {
 	metaStart := 0
 	for _, e := range w.entries {
+		// Entries with data blocks were counted by writeDataBlocks. Publish
+		// every 64 entries to keep the cost low for many small entries.
+		if !w.hasDataBlocks(e) {
+			// Inline data and data in the data file are written here, as
+			// part of the inode. Secondary hard-link names share the
+			// primary's data.
+			if e.hardLinkPrimary == nil {
+				w.dataDone += e.dataBytes
+			}
+			w.entryDone(w.done%64 == 0)
+		}
 		// Secondary hard-link entries share the primary's on-disk inode.
 		if e.hardLinkPrimary != nil {
 			continue
@@ -668,15 +705,7 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 		switch e.mode & disk.StatTypeMask {
 		case disk.StatTypeReg:
 			expected := int64(ds)
-			var written int64
-			var err error
-			limited := io.LimitReader(e.data, expected)
-			// Use io.Copy for *os.File sources to enable copy_file_range.
-			if _, ok := e.data.(*os.File); ok {
-				written, err = io.Copy(out, limited)
-			} else {
-				written, err = io.CopyBuffer(onlyWriter{out}, limited, w.copyBuf)
-			}
+			written, err := w.copyData(out, e.data, expected)
 			if c, ok := e.data.(io.Closer); ok {
 				_ = c.Close()
 			}
@@ -707,8 +736,44 @@ func (w *erofsWriter) writeDataBlocks(out io.Writer) error {
 				return fmt.Errorf("write padding for %s: %w", e.path, err)
 			}
 		}
+		w.entryDone(true)
 	}
 	return nil
+}
+
+// copyChunk bounds how much file data is copied between updates of
+// DataBytesWritten, so that a single large file still shows progress.
+// Splitting the copy costs one extra copy_file_range call per piece for
+// *os.File sources, and nothing measurable otherwise.
+const copyChunk = 8 << 20
+
+// copyData copies size bytes from src to out, adding each piece to
+// DataBytesWritten. It uses io.Copy for *os.File sources, such as files from
+// a CopyFrom of os.DirFS, so the copy can use copy_file_range. Spooled data
+// is read through an io.SectionReader and copied with copyBuf.
+func (w *erofsWriter) copyData(out io.Writer, src io.Reader, size int64) (int64, error) {
+	_, isFile := src.(*os.File)
+	var written int64
+	for written < size {
+		limited := io.LimitReader(src, min(size-written, copyChunk))
+		var n int64
+		var err error
+		if isFile {
+			n, err = io.Copy(out, limited)
+		} else {
+			n, err = io.CopyBuffer(onlyWriter{out}, limited, w.copyBuf)
+		}
+		written += n
+		w.dataDone += n
+		w.progress.dataBytesWritten.Store(w.dataDone)
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			break // short source; the caller reports the mismatch
+		}
+	}
+	return written, nil
 }
 
 // flatPlainDataSize returns the data size for a flat-plain entry, or 0.

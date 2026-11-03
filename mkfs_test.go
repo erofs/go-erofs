@@ -3789,3 +3789,32 @@ func TestCompactInodeEndsImage(t *testing.T) {
 		}
 	}
 }
+
+// TestCopyFromReplaceDirWithFile checks that a later CopyFrom replacing a
+// directory with a file drops the directory's contents.
+func TestCopyFromReplaceDirWithFile(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.CopyFrom(fstest.MapFS{
+		"d/x":   {Data: []byte("x")},
+		"d/s/y": {Data: []byte("y")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.CopyFrom(fstest.MapFS{"d": {Data: []byte("file")}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/d/x", "/d/s", "/d/s/y"} {
+		if _, err := w.Stat(p); err == nil {
+			t.Errorf("Stat(%s) after /d became a file: got nil error, want an error", p)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	img, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	erofstest.CheckFile(t, img, "d", "file")
+}

@@ -44,6 +44,7 @@ func buildAndVerify(t *testing.T, build func(w *erofs.Writer)) fs.FS {
 	if err != nil {
 		t.Fatal("Open:", err)
 	}
+	checkProgressComplete(t, w, efs)
 	return efs
 }
 

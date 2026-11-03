@@ -47,6 +47,8 @@ type Writer struct {
 	noInlineData bool     // from WithNoInlineData
 	cpBuf        []byte   // shared buffer for io.Copy into File
 	padBuf       []byte   // shared zero buffer for padding (block-sized, lazy)
+
+	progress progressCounters // see Writer.Progress
 }
 
 // File is a writable regular file returned by Writer.Create.
@@ -644,6 +646,7 @@ func (fsys *Writer) Close() error {
 		chunkBits:    chunkBits,
 		noInlineData: fsys.noInlineData,
 		zeroBuf:      make([]byte, fsys.blockSize),
+		progress:     &fsys.progress,
 	}
 
 	ew.planLayout(root)
@@ -849,12 +852,14 @@ func (f *File) Write(p []byte) (int, error) {
 		n, err := f.fs.dataFile.Write(p)
 		f.written += int64(n)
 		f.fs.dataOff += int64(n)
+		f.fs.addData(f.entry.ino, int64(n))
 		return n, err
 	}
 
 	n, err := f.fs.spool.Write(p)
 	f.written += int64(n)
 	f.fs.spoolOff += int64(n)
+	f.fs.addData(f.entry.ino, int64(n))
 	return n, err
 }
 
@@ -945,6 +950,9 @@ type fsInode struct {
 	directData   io.Reader // non-nil when data is referenced directly (no spool copy)
 
 	metadataOnly bool // chunk-based layout even when chunks is nil
+
+	names     int   // names in the tree that refer to this inode
+	dataBytes int64 // file data counted in Progress.DataBytes for this inode
 }
 
 // fsEntry is the directory-entry view of a file. It carries only the path
@@ -1033,6 +1041,8 @@ type erofsEntry struct {
 	nlink   uint32
 	size    uint64
 	rdev    uint32
+
+	dataBytes int64 // file data counted in Progress.DataBytes
 
 	name      string
 	path      string
@@ -1383,6 +1393,12 @@ func (fsys *Writer) add(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*f
 		// names that still reference it get a correct nlink.
 		if existing.ino != ino {
 			unlinkInode(existing.ino)
+			fsys.dropName(existing.ino)
+			ino.names++
+		}
+		// A directory replaced by a non-directory loses its contents.
+		if existing.ino.mode&disk.StatTypeMask == disk.StatTypeDir && typ != disk.StatTypeDir {
+			fsys.removeSubtree(existing)
 		}
 		existing.ino = ino
 		fe = existing
@@ -1438,6 +1454,7 @@ func (fsys *Writer) add(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*f
 			// Spool mode: keep a direct reference to avoid copying.
 			ino.directData = be.Data
 			ino.fileClosed = true
+			fsys.addData(ino, int64(size))
 		}
 	} else {
 		ino.fileClosed = true
@@ -1492,6 +1509,8 @@ func (fsys *Writer) addChild(e *fsEntry) {
 	e.parent = parent
 	parent.children = append(parent.children, e)
 	fsys.byPath[e.path] = e
+	e.ino.names++
+	fsys.progress.entries.Add(1)
 }
 
 // remove marks an entry and all its descendants as removed.
@@ -1504,7 +1523,9 @@ func (fsys *Writer) remove(p string) {
 	}
 	e.removed = true
 	delete(fsys.byPath, p)
+	fsys.progress.entries.Add(-1)
 	unlinkInode(e.ino)
+	fsys.dropName(e.ino)
 	if e.ino.mode&disk.StatTypeMask == disk.StatTypeDir {
 		fsys.removeSubtree(e)
 	}
@@ -1527,7 +1548,9 @@ func (fsys *Writer) removeSubtree(e *fsEntry) {
 		if !c.removed {
 			c.removed = true
 			delete(fsys.byPath, c.path)
+			fsys.progress.entries.Add(-1)
 			unlinkInode(c.ino)
+			fsys.dropName(c.ino)
 			if c.ino.mode&disk.StatTypeMask == disk.StatTypeDir {
 				fsys.removeSubtree(c)
 			}
@@ -1645,6 +1668,7 @@ func (fsys *Writer) fsToErofs(entry *fsEntry) *erofsEntry {
 		contiguous:    ino.contiguous,
 		metadataOnly:  ino.metadataOnly,
 		data:          data,
+		dataBytes:     ino.dataBytes,
 		xattrs:        ino.xattrs,
 		erofsFileType: modeToFileType(ino.mode),
 	}
