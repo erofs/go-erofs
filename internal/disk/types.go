@@ -4,12 +4,17 @@ const (
 	MagicNumber      = 0xe0f5e1e2
 	SuperBlockOffset = 1024
 
-	FeatureIncompatLZ4_0Padding         = 0x1
+	FeatureIncompatLZ4_0Padding = 0x1
+	// FeatureIncompatComprCfgs (also Z_EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER, same
+	// bit) marks the presence of compression configuration descriptors after the
+	// superblock.
+	FeatureIncompatComprCfgs            = 0x2
 	FeatureIncompatChunkedFile          = 0x4
 	FeatureIncompatDeviceTable          = 0x8
 	FeatureIncompatFragments            = 0x20
 	FeatureIncompatXattrPrefixes        = 0x40
 	FeatureIncompatAll           uint32 = FeatureIncompatLZ4_0Padding |
+		FeatureIncompatComprCfgs |
 		FeatureIncompatChunkedFile | FeatureIncompatDeviceTable |
 		FeatureIncompatFragments | FeatureIncompatXattrPrefixes
 
@@ -21,6 +26,9 @@ const (
 	SizeXattrEntry      = 4
 	SizeDeviceSlot      = 128
 	SizeChunkIndex      = 8
+	SizeZMapHeader      = 8
+	SizeLclusterIndex   = 8
+	SizeLZ4Cfgs         = 14
 
 	LayoutFlatPlain         = 0
 	LayoutCompressedFull    = 1
@@ -31,6 +39,38 @@ const (
 	LayoutChunkFormatBits    = 0x001F
 	LayoutChunkFormatIndexes = 0x0020
 	LayoutChunkFormat48Bit   = 0x0040
+
+	// ComprAlg* are bits in SuperBlock.ComprAlgs identifying which compression
+	// algorithms appear in the image.
+	ComprAlgLZ4     = 0x1
+	ComprAlgLZMA    = 0x2
+	ComprAlgDeflate = 0x4
+	ComprAlgZstd    = 0x8
+
+	// ZLclusterType* are the values of the lower 2 bits of
+	// z_erofs_lcluster_index.di_advise.
+	ZLclusterTypePlain   = 0
+	ZLclusterTypeHead1   = 1
+	ZLclusterTypeNonhead = 2
+	ZLclusterTypeHead2   = 3
+	ZLclusterTypeMask    = 0x3
+
+	// ZLclusterPartialRef indicates the lcluster's data may be shared with
+	// another inode (dedupe). Unused for read; kept here for completeness.
+	ZLclusterPartialRef = 1 << 2
+
+	// ZLclusterD0CBlkCnt: when set in a full-layout NONHEAD's delta[0]
+	// (low 16 bits of di_u), the remaining 11 bits encode the physical block
+	// count of the surrounding pcluster (big pcluster).
+	ZLclusterD0CBlkCnt = 1 << 11
+
+	// ZAdvise* are bits in z_erofs_map_header.h_advise.
+	ZAdviseCompacted2B        = 1 << 0
+	ZAdviseBigPcluster1       = 1 << 1
+	ZAdviseBigPcluster2       = 1 << 2
+	ZAdviseInlinePcluster     = 1 << 3
+	ZAdviseInterlacedPcluster = 1 << 4
+	ZAdviseFragmentPcluster   = 1 << 5
 )
 
 // SuperBlock represents the EROFS on-disk superblock.
@@ -143,6 +183,37 @@ type InodeChunkIndex struct {
 	StartBlkHi uint16 // part of 48-bit support (not yet implemented)
 	DeviceID   uint16
 	StartBlkLo uint32
+}
+
+// ZMapHeader is the 8-byte z_erofs_map_header that sits after xattrs in a
+// compressed inode and describes the cluster index layout that follows.
+type ZMapHeader struct {
+	Reserved1     uint16
+	IdataSize     uint16
+	Advise        uint16
+	ClusterBits   uint8 // log2(lcluster size) - SuperBlock.BlkSizeBits (low 3 bits)
+	AlgorithmType uint8 // low 4 bits: head1 algo; high 4 bits: head2 algo
+}
+
+// LclusterIndex is an 8-byte z_erofs_lcluster_index entry in the
+// LayoutCompressedFull index map.
+//
+// For PLAIN/HEAD types, U is the physical block address of the (start of the)
+// pcluster.  For NONHEAD types, the low 16 bits of U are delta[0] (distance
+// back to the head lcluster) and the high 16 bits are delta[1] (distance
+// forward to the next head).
+type LclusterIndex struct {
+	Advise     uint16
+	ClusterOfs uint16
+	U          uint32
+}
+
+// LZ4Cfgs is the LZ4 entry of the COMPR_CFGS records that follow the
+// superblock when FeatureIncompatComprCfgs is set.
+type LZ4Cfgs struct {
+	MaxDistance     uint16
+	MaxPclusterBlks uint16
+	Reserved        [10]uint8
 }
 
 // DeviceSlot represents the on-disk device table entry (erofs_deviceslot).
