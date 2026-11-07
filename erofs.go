@@ -225,11 +225,16 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 		}
 	}
 
-	// Error out filesystems with unsupported compressed inodes
-	if i.sb.FeatureIncompat&disk.FeatureIncompatLZ4_0Padding != 0 ||
-		i.sb.ComprAlgs != 0 {
-		return nil, fmt.Errorf("unsupported compressed filesystem (FeatureIncompat=0x%x, ComprAlgs=0x%x): %w",
-			i.sb.FeatureIncompat, i.sb.ComprAlgs, ErrNotImplemented)
+	// Parse the per-algorithm compression configuration blob. LZ4-only
+	// images have no blob (the superblock's u1 field is then
+	// lz4_max_distance, not an algorithm bitmap).
+	i.comprCfg.lzma = defaultLZMAConfig()
+	if i.sb.FeatureIncompat&disk.FeatureIncompatComprCfgs != 0 {
+		cfg, err := readCompressionConfig(r, &i.sb)
+		if err != nil {
+			return nil, fmt.Errorf("invalid compression configuration: %w", err)
+		}
+		i.comprCfg = cfg
 	}
 
 	i.blkPool.New = func() any {
@@ -275,6 +280,11 @@ type image struct {
 	longPrefixes []string // cached long xattr prefixes
 	prefixesOnce sync.Once
 	prefixesErr  error
+
+	// Compression parameters parsed from the superblock's COMPR_CFGS blob.
+	comprCfg compressionConfig
+	// Decompressed physical-cluster LRU cache.
+	comprCache compressedCache
 }
 
 // start physical offset of the separate metadata zone
@@ -702,7 +712,7 @@ func (img *image) loadBlock(fi *inode, pos int64) (*block, error) {
 		b.end = int32(blockEnd)
 		return b, nil
 	case disk.LayoutCompressedFull, disk.LayoutCompressedCompact:
-		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrNotImplemented)
+		return img.loadCompressedBlock(fi, pos)
 	default:
 		return nil, fmt.Errorf("inode layout (%d) for %d: %w", fi.inodeLayout, fi.nid, ErrInvalid)
 	}
@@ -1267,6 +1277,29 @@ func (b *file) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ReadAt implements [io.ReaderAt] for files in the image. It reads len(p)
+// bytes starting at off and does not modify the file's sequential read
+// offset.
+func (b *file) ReadAt(p []byte, off int64) (int, error) {
+	fi, err := b.readInfo()
+	if err != nil {
+		return 0, err
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset: %w", ErrInvalid)
+	}
+	if off >= fi.size {
+		return 0, io.EOF
+	}
+	clone := *b
+	clone.offset = off
+	n, err := clone.Read(p)
+	if n < len(p) && err == nil {
+		err = io.EOF
+	}
+	return n, err
+}
+
 func (b *file) Close() error {
 	if b.info != nil && b.info.cached != nil {
 		b.img.putBlock(b.info.cached)
@@ -1619,6 +1652,10 @@ type inode struct {
 	mtime       uint64
 	mtimeNs     uint32
 	cached      *block
+
+	// Compressed-inode cluster map, initialized lazily on first data read.
+	zmap    *zmap
+	zmapErr error
 }
 
 func (ino *inode) flatDataOffset() int64 {
