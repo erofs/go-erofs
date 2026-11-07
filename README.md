@@ -20,7 +20,7 @@ A Go library for reading and creating [EROFS](https://erofs.docs.kernel.org/) fi
 - [x] Directory to erofs packing
 - [x] AUFS whiteout to overlayfs conversion
 - [x] Merge multiple filesystem layers with whiteout processing
-- [ ] Read erofs files with compression
+- [x] Read erofs files with compression (LZ4, LZMA, DEFLATE, ZSTD)
 
 ## Reading an EROFS image
 
