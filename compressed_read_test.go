@@ -6,7 +6,6 @@ package erofs_test
 
 import (
 	"bytes"
-	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -188,7 +187,7 @@ func TestCompressedImageReadAt(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open(big.bin): %v", err)
 			}
-			defer file.Close()
+			defer func() { _ = file.Close() }()
 			readerAt, ok := file.(interface {
 				ReadAt([]byte, int64) (int, error)
 			})
@@ -281,9 +280,8 @@ func TestCompressedImageFormatString(t *testing.T) {
 				t.Fatalf("ReadFile: %v", err)
 			}
 			if string(content) != "content\n" {
-				t.Fatalf("content = %q", content)
+				t.Fatalf("%s: content = %q", compressor, content)
 			}
-			_ = fmt.Sprintf("%s", compressor)
 		})
 	}
 }

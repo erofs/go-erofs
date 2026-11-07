@@ -338,7 +338,8 @@ func decodeLZMA(input, output []byte, cfg lzmaConfig, partial bool) error {
 
 func decodeDeflate(input, output []byte) error {
 	r := flate.NewReader(bytes.NewReader(input))
-	defer r.Close()
+	// flate's ReadCloser.Close only ever returns nil.
+	defer func() { _ = r.Close() }()
 	n, err := io.ReadFull(r, output)
 	if err != nil {
 		return fmt.Errorf("deflate: decompressed %d bytes, want %d: %w: %v", n, len(output), ErrInvalid, err)

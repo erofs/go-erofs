@@ -149,12 +149,6 @@ type zmap struct {
 	tailErr       error
 }
 
-type tailInfo struct {
-	headLCN   uint64
-	inlineOff int64
-	fragStart int64
-}
-
 func openZmap(img *image, ino *inode) (*zmap, error) {
 	bodyEnd := img.metaStartPos() + int64(ino.nid)*disk.SizeInodeCompact +
 		int64(ino.icsize) + int64(ino.xsize)
@@ -265,13 +259,6 @@ func openZmap(img *image, ino *inode) (*zmap, error) {
 	return z, nil
 }
 
-// fragmentOff stores the full 64-bit fragment offset for the whole-inode
-// fragment case. For the ordinary 32-bit h_fragmentoff case it stays zero and
-// the low 32 bits are read from the header directly.
-var _ = math.MaxUint32
-
-func (z *zmap) lclusterCount() uint64 { return z.totalIdx }
-
 func (z *zmap) readLcluster(i uint64) (zclusterEntry, error) {
 	if i >= z.totalIdx {
 		return zclusterEntry{}, fmt.Errorf("lcluster %d out of range (count %d): %w", i, z.totalIdx, ErrInvalid)
@@ -306,7 +293,7 @@ func (z *zmap) readLegacyLcluster(i uint64) (zclusterEntry, error) {
 				i, e.clusterofs, z.lclusterSize, ErrInvalid)
 		}
 	case zErofsLclusterTypeNonhead:
-		d0 := uint32(u & 0xffff)
+		d0 := u & 0xffff
 		if d0&zErofsLID0Cblkcnt != 0 {
 			if !z.bigPcluster1 && !z.bigPcluster2 {
 				return zclusterEntry{}, fmt.Errorf("lcluster %d: CBLKCNT without BIG_PCLUSTER: %w", i, ErrInvalid)
@@ -586,13 +573,13 @@ func (z *zmap) resolveExtent(off int64) (compressedExtent, error) {
 	case zErofsLclusterTypeHead1:
 		algo, err := compressionAlgorithmFromID(z.algoHead1)
 		if err != nil {
-			return compressedExtent{}, maybeNotImplemented(err)
+			return compressedExtent{}, err
 		}
 		ext.algo = algo
 	case zErofsLclusterTypeHead2:
 		algo, err := compressionAlgorithmFromID(z.algoHead2)
 		if err != nil {
-			return compressedExtent{}, maybeNotImplemented(err)
+			return compressedExtent{}, err
 		}
 		ext.algo = algo
 	}
@@ -686,21 +673,6 @@ func (z *zmap) pclusterBlocks(headLCN uint64, head zclusterEntry) (uint64, error
 		return 0, fmt.Errorf("nid %d: invalid BIG_PCLUSTER marker at lcluster %d: %w", z.nid, nextLCN, ErrInvalid)
 	}
 	return uint64(next.cblkcnt), nil
-}
-
-func (z *zmap) headerAlgorithm(typ uint8) (compressionAlgorithm, error) {
-	switch typ {
-	case zErofsLclusterTypeHead1:
-		return compressionAlgorithmFromID(z.algoHead1)
-	case zErofsLclusterTypeHead2:
-		return compressionAlgorithmFromID(z.algoHead2)
-	default:
-		return 0, fmt.Errorf("lcluster type %d has no compression algorithm: %w", typ, ErrInvalid)
-	}
-}
-
-func maybeNotImplemented(err error) error {
-	return fmt.Errorf("%w", err)
 }
 
 // compressedExtent describes one physical cluster's mapping into the

@@ -31,7 +31,7 @@ func comprCfgsBlob(records ...[]byte) []byte {
 
 // imageWithComprCfgs lays out a superblock plus COMPR_CFGS blob the way
 // readCompressionConfig expects to find them.
-func imageWithComprCfgs(superblock disk.SuperBlock, blob []byte) []byte {
+func imageWithComprCfgs(blob []byte) []byte {
 	image := make([]byte, disk.SuperBlockOffset+disk.SizeSuperBlock+len(blob))
 	copy(image[disk.SuperBlockOffset+disk.SizeSuperBlock:], blob)
 	return image
@@ -99,7 +99,7 @@ func TestReadCompressionConfig(t *testing.T) {
 			FeatureIncompat: disk.FeatureIncompatComprCfgs,
 			ComprAlgs:       1 << disk.CompressionLZMA,
 		}
-		image := imageWithComprCfgs(superblock, comprCfgsBlob(lzmaRecord(1<<23, 0)))
+		image := imageWithComprCfgs(comprCfgsBlob(lzmaRecord(1<<23, 0)))
 		cfg, err := readCompressionConfig(bytes.NewReader(image), &superblock)
 		if err != nil {
 			t.Fatal(err)
@@ -115,7 +115,7 @@ func TestReadCompressionConfig(t *testing.T) {
 			ComprAlgs:       (1 << disk.CompressionLZ4) | (1 << disk.CompressionLZMA),
 		}
 		lz4 := make([]byte, 4) // max_distance, max_pclusterblks
-		image := imageWithComprCfgs(superblock, comprCfgsBlob(lz4, lzmaRecord(1<<22, 0)))
+		image := imageWithComprCfgs(comprCfgsBlob(lz4, lzmaRecord(1<<22, 0)))
 		cfg, err := readCompressionConfig(bytes.NewReader(image), &superblock)
 		if err != nil {
 			t.Fatal(err)
@@ -140,7 +140,7 @@ func TestReadCompressionConfig(t *testing.T) {
 			FeatureIncompat: disk.FeatureIncompatComprCfgs,
 			ComprAlgs:       1 << disk.CompressionLZMA,
 		}
-		image := imageWithComprCfgs(superblock, comprCfgsBlob(lzmaRecord(1<<20, 2)))
+		image := imageWithComprCfgs(comprCfgsBlob(lzmaRecord(1<<20, 2)))
 		if _, err := readCompressionConfig(bytes.NewReader(image), &superblock); !errors.Is(err, ErrNotImplemented) {
 			t.Errorf("lzma format error = %v, want ErrNotImplemented", err)
 		}
@@ -153,7 +153,7 @@ func TestReadCompressionConfig(t *testing.T) {
 		}
 		deflate := make([]byte, 6)
 		deflate[0] = 16 // window bits above 15
-		image := imageWithComprCfgs(superblock, comprCfgsBlob(deflate))
+		image := imageWithComprCfgs(comprCfgsBlob(deflate))
 		if _, err := readCompressionConfig(bytes.NewReader(image), &superblock); !errors.Is(err, ErrInvalid) {
 			t.Errorf("deflate window error = %v, want ErrInvalid", err)
 		}
