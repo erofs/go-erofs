@@ -190,6 +190,14 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 	if unknownFeat != 0 {
 		return nil, fmt.Errorf("unsupported incompatible feature 0x%x: %w", unknownFeat, ErrNotImplemented)
 	}
+	i.rootNid = uint64(i.sb.RootNid)
+	if i.is48Bit() && i.sb.RootNid8B != 0 {
+		// RootNid holds the high bits of the block count instead.
+		if i.sb.RootNid != 0 {
+			return nil, fmt.Errorf("48-bit block count: %w", ErrNotImplemented)
+		}
+		i.rootNid = i.sb.RootNid8B
+	}
 	ondiskExtraDevices := uint32(0)
 	if i.sb.FeatureIncompat&disk.FeatureIncompatDeviceTable != 0 {
 		ondiskExtraDevices = uint32(i.sb.ExtraDevices)
@@ -216,6 +224,10 @@ func Open(r io.ReaderAt, opts ...OpenOpt) (fs.FS, error) {
 			var slot disk.DeviceSlot
 			if _, err := binary.Decode(slotBuf[:], binary.LittleEndian, &slot); err != nil {
 				return nil, fmt.Errorf("failed to decode device slot %d: %w", idx, err)
+			}
+			// blocks_hi and uniaddr_hi in the first reserved bytes.
+			if i.is48Bit() && binary.LittleEndian.Uint32(slot.Reserved[:4]) != 0 {
+				return nil, fmt.Errorf("48-bit device slot %d: %w", idx, ErrNotImplemented)
 			}
 			i.devices[idx] = deviceInfo{
 				device:        o.extraDevices[idx],
@@ -266,7 +278,8 @@ type deviceInfo struct {
 }
 
 type image struct {
-	sb disk.SuperBlock
+	sb      disk.SuperBlock
+	rootNid uint64
 
 	meta         io.ReaderAt
 	devices      []deviceInfo // parsed device table entries
@@ -320,8 +333,58 @@ func (img *image) mapDev(deviceID uint16, pa int64) (io.ReaderAt, int64, error) 
 // blockSize returns the filesystem block size.
 func (img *image) blockSize() uint32 { return 1 << img.sb.BlkSizeBits }
 
-// buildTime returns the build timestamp from the superblock.
-func (img *image) buildTime() uint64 { return img.sb.BuildTime }
+// is48Bit reports whether the image uses the 48-bit layout.
+func (img *image) is48Bit() bool {
+	return img.sb.FeatureIncompat&disk.FeatureIncompat48Bit != 0
+}
+
+// buildTime returns the build timestamp from the superblock. In the 48-bit
+// layout, the superblock BuildTime is the epoch for compact inode mtimes and
+// the build time is stored as an offset from it.
+func (img *image) buildTime() uint64 {
+	if img.is48Bit() {
+		return img.sb.BuildTime + uint64(img.sb.BuildTimeOffset)
+	}
+	return img.sb.BuildTime
+}
+
+// compactMtime returns the mtime of a compact inode with the given i_mtime
+// field. Like the kernel, it adds the field regardless of the layout; writers
+// that do not use it leave it zero.
+func (img *image) compactMtime(rel uint32) (uint64, uint32) {
+	return img.sb.BuildTime + uint64(rel), img.sb.BuildTimeNs
+}
+
+// compactNlink decodes the i_nb field of a compact inode. With
+// InodeNlink1Bit set on a non-directory, the link count is 1 and the field
+// holds the high bits of the block address, checked by checkStartBlkHi.
+func compactNlink(format, mode, nb uint16, startBlkLo uint32) (uint32, error) {
+	if format&(1<<disk.InodeNlink1Bit) == 0 || mode&disk.StatTypeMask == disk.StatTypeDir {
+		return uint32(nb), nil
+	}
+	if err := checkStartBlkHi(mode, nb, startBlkLo); err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
+// checkStartBlkHi returns ErrNotImplemented if the block address of an
+// inode, split into the i_nb (hi) and i_u (lo) fields, needs more than 32
+// bits. The null address, all ones, is accepted: in the 48-bit layout
+// mkfs.erofs writes it for inodes without data blocks, and the kernel
+// treats it as no address. Only regular files, directories and symlinks
+// have a block address; the kernel ignores the field for other types.
+func checkStartBlkHi(mode, hi uint16, lo uint32) error {
+	switch mode & disk.StatTypeMask {
+	case disk.StatTypeReg, disk.StatTypeDir, disk.StatTypeSymlink:
+	default:
+		return nil
+	}
+	if hi == 0 || (hi == 0xFFFF && lo == 0xFFFFFFFF) {
+		return nil
+	}
+	return fmt.Errorf("48-bit block address: %w", ErrNotImplemented)
+}
 
 // deviceBlocks returns the total block count across all extra devices.
 // Each device's block count is reported at the device's native block size
@@ -772,7 +835,7 @@ func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.File
 		name = ""
 	}
 
-	nid = uint64(i.sb.RootNid)
+	nid = i.rootNid
 	ftype = fs.ModeDir
 
 	// curPath tracks the full resolved path of the current directory
@@ -837,7 +900,7 @@ func (i *image) resolve(op, name string, follow bool) (nid uint64, ftype fs.File
 			if len(target) > 0 && target[0] == '/' {
 				target = target[1:]
 			}
-			nid = uint64(i.sb.RootNid)
+			nid = i.rootNid
 			ftype = fs.ModeDir
 			curPath = ""
 			name = target
@@ -1017,6 +1080,11 @@ func (b *file) readInfo() (ino *inode, err error) {
 		if _, err := binary.Decode(buf[:disk.SizeInodeCompact], binary.LittleEndian, &di); err != nil {
 			return nil, err
 		}
+		var nlink uint32
+		if nlink, err = compactNlink(format, di.Mode, di.Nlink, di.InodeData); err != nil {
+			return nil, err
+		}
+		mtime, mtimeNs := b.img.compactMtime(di.Mtime)
 		b.info = &inode{
 			name:        b.name,
 			nid:         b.nid,
@@ -1028,14 +1096,17 @@ func (b *file) readInfo() (ino *inode, err error) {
 			rawMode:     di.Mode,
 			uid:         uint32(di.UID),
 			gid:         uint32(di.GID),
-			nlink:       int(di.Nlink),
-			mtime:       b.img.sb.BuildTime,
-			mtimeNs:     b.img.sb.BuildTimeNs,
+			nlink:       int(nlink),
+			mtime:       mtime,
+			mtimeNs:     mtimeNs,
 		}
 		xcnt = di.XattrCount
 	} else {
 		var di disk.InodeExtended
 		if _, err = binary.Decode(buf[:disk.SizeInodeExtended], binary.LittleEndian, &di); err != nil {
+			return nil, err
+		}
+		if err = checkStartBlkHi(di.Mode, di.StartBlkHi, di.InodeData); err != nil {
 			return nil, err
 		}
 		b.info = &inode{

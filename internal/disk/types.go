@@ -9,9 +9,17 @@ const (
 	FeatureIncompatDeviceTable          = 0x8
 	FeatureIncompatFragments            = 0x20
 	FeatureIncompatXattrPrefixes        = 0x40
+	FeatureIncompat48Bit                = 0x80
 	FeatureIncompatAll           uint32 = FeatureIncompatLZ4_0Padding |
 		FeatureIncompatChunkedFile | FeatureIncompatDeviceTable |
-		FeatureIncompatFragments | FeatureIncompatXattrPrefixes
+		FeatureIncompatFragments | FeatureIncompatXattrPrefixes |
+		FeatureIncompat48Bit
+
+	FeatureCompatMtime = 0x2
+
+	// InodeNlink1Bit in i_format marks a non-directory compact inode with
+	// nlink 1, whose i_nb field then holds the high bits of its block address.
+	InodeNlink1Bit = 4
 
 	SizeSuperBlock      = 128
 	SizeInodeCompact    = 32
@@ -43,8 +51,8 @@ type SuperBlock struct {
 	ExtSlots         uint8
 	RootNid          uint16
 	Inos             uint64
-	BuildTime        uint64
-	BuildTimeNs      uint32
+	BuildTime        uint64 // epoch: base seconds for compact inode mtimes
+	BuildTimeNs      uint32 // fixed nanoseconds for compact inode mtimes
 	Blocks           uint32
 	MetaBlkAddr      uint32
 	XattrBlkAddr     uint32
@@ -59,7 +67,10 @@ type SuperBlock struct {
 	XattrPrefixStart uint32
 	PackedNid        uint64 // Nid of the special "packed" inode for shared data/prefixes
 	XattrFilterRes   uint8
-	Reserved         [23]uint8
+	Reserved         [3]uint8
+	BuildTimeOffset  uint32 // (48-bit) mkfs time as seconds after BuildTime
+	RootNid8B        uint64 // (48-bit) root nid; RootNid then holds blocks_hi
+	Reserved2        [8]uint8
 }
 
 // InodeCompact represents the 32-byte on-disk compact inode.
@@ -67,9 +78,9 @@ type InodeCompact struct {
 	Format     uint16 // i_format
 	XattrCount uint16 // i_xattr_icount
 	Mode       uint16 // i_mode
-	Nlink      uint16 // i_nlink
+	Nlink      uint16 // i_nb: nlink, or startblk_hi with InodeNlink1Bit
 	Size       uint32 // i_size
-	Reserved   uint32 // i_reserved
+	Mtime      uint32 // i_mtime: seconds after the superblock BuildTime
 	InodeData  uint32 // i_u (i_raw_blkaddr, i_rdev, etc.)
 	Inode      uint32 // i_ino
 	UID        uint16 // i_uid
@@ -82,7 +93,7 @@ type InodeExtended struct {
 	Format     uint16 // i_format
 	XattrCount uint16 // i_xattr_icount
 	Mode       uint16 // i_mode
-	Reserved   uint16 // i_reserved
+	StartBlkHi uint16 // i_nb: high bits of the block address (48-bit)
 	Size       uint64 // i_size
 	InodeData  uint32 // i_u (i_raw_blkaddr, i_rdev, etc.)
 	Inode      uint32 // i_ino
