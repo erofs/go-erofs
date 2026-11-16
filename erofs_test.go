@@ -64,8 +64,8 @@ func TestErofs(t *testing.T) {
 		erofstest.SparseFiles.Run(t, erofstest.MkfsErofsMaxSize(1024*1024, chunkFlag))
 	})
 
-	// Compression format is unimplemented — verify EroFS returns ErrNotImplemented.
-	t.Run("lz4-unimplemented", func(t *testing.T) {
+	// Compressed images are decoded since the compressed-read feature.
+	t.Run("lz4-compressed", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("mkfs.erofs compression is not included on Windows")
 		}
@@ -95,9 +95,16 @@ func TestErofs(t *testing.T) {
 			}
 		}()
 
-		_, err = erofs.Open(f)
-		if !errors.Is(err, erofs.ErrNotImplemented) {
-			t.Fatalf("expected ErrNotImplemented, got %v", err)
+		img, err := erofs.Open(f)
+		if err != nil {
+			t.Fatalf("opening a compressed image: %v", err)
+		}
+		content, err := fs.ReadFile(img, "file.txt")
+		if err != nil {
+			t.Fatalf("reading a compressed file: %v", err)
+		}
+		if string(content) != "content\n" {
+			t.Fatalf("file content = %q", content)
 		}
 	})
 }
