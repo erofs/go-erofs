@@ -88,6 +88,56 @@ func TestCreateFSSpool(t *testing.T) {
 	erofstest.CheckDirEntries(t, efs, "subdir", []string{"nested.txt"})
 }
 
+// TestCreateFSNonSeekable writes an image to an io.Writer that cannot seek
+// and already holds data, and checks that the image follows that data and
+// matches the image written to a seekable buffer.
+func TestCreateFSNonSeekable(t *testing.T) {
+	build := func(out io.Writer) {
+		t.Helper()
+		fsys := erofs.Create(out)
+		f, err := fsys.Create("/dir/file.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(bytes.Repeat([]byte("streamed "), 1000)); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := fsys.Symlink("dir/file.txt", "/link"); err != nil {
+			t.Fatal(err)
+		}
+		if err := fsys.Close(); err != nil {
+			t.Fatal("Close:", err)
+		}
+	}
+
+	var seekable testBuffer
+	build(&seekable)
+
+	prefix := []byte("not part of the image")
+	stream := bytes.NewBuffer(slices.Clone(prefix))
+	build(stream)
+
+	got := stream.Bytes()
+	if !bytes.Equal(got[:len(prefix)], prefix) {
+		t.Fatal("data before the image was overwritten")
+	}
+	img := got[len(prefix):]
+	if !bytes.Equal(img, seekable.Bytes()) {
+		t.Fatal("image written to a stream differs from the image written to a seekable buffer")
+	}
+
+	erofstest.FsckErofsBytes(t, img)
+	efs, err := erofs.Open(bytes.NewReader(img))
+	if err != nil {
+		t.Fatal("EroFS:", err)
+	}
+	erofstest.CheckFileBytes(t, efs, "dir/file.txt", bytes.Repeat([]byte("streamed "), 1000))
+	erofstest.CheckSymlink(t, efs, "link", "dir/file.txt")
+}
+
 // TestCreateFSDataFile exercises data file mode (metadata-only).
 func TestCreateFSDataFile(t *testing.T) {
 	dataPath := filepath.Join(t.TempDir(), "data.bin")

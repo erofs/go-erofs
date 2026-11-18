@@ -77,23 +77,18 @@ func (w *erofsWriter) minChunkBits(size uint64) uint8 {
 	return bits
 }
 
-func (w *erofsWriter) write(out io.WriteSeeker) error {
+// write uses a data-first on-disk layout: block0, data blocks, metadata.
+// This matches how mkfs.erofs lays out streaming sources. The layout is
+// fully planned before anything is written, so the superblock is written
+// first and out is written strictly in order.
+func (w *erofsWriter) write(out io.Writer) error {
 	w.copyBuf = make([]byte, 256*1024) // shared io.CopyBuffer buffer
-	return w.writeSeekable(out)
-}
 
-// writeSeekable uses a data-first on-disk layout: block0 (placeholder),
-// data blocks, metadata. After everything is written, it seeks back to
-// write the real superblock. This matches how mkfs.erofs lays out
-// streaming sources — data is written as it arrives, metadata last.
-func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
-	// Data-first layout: sbArea, data blocks, metadata.
 	// Set metaBlkAddr to a sentinel so assignDataBlocks uses data-first.
 	w.metaBlkAddr = 0xFFFFFFFF
 	w.assignDataBlocks()
 
-	// Write placeholder superblock area.
-	if _, err := out.Write(make([]byte, w.sbAreaSize())); err != nil {
+	if err := w.writeBlock0(out); err != nil {
 		return err
 	}
 
@@ -110,14 +105,6 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 	if _, err := meta.WriteTo(out); err != nil {
 		return err
 	}
-
-	// Seek back and write the real block 0 (superblock).
-	if _, err := out.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := w.writeBlock0(out); err != nil {
-		return err
-	}
 	w.progress.dataBytesWritten.Store(w.dataDone)
 	w.progress.entriesWritten.Store(int64(len(w.entries) - 1))
 	return nil
@@ -126,7 +113,7 @@ func (w *erofsWriter) writeSeekable(out io.WriteSeeker) error {
 // entriesWritten returns the entry count reported by Writer.Progress. Each
 // entry is counted once: in writeDataBlocks if it has data blocks, otherwise
 // in writeMetadataInodes. The count excludes the root and stays below the
-// total until writeSeekable has written the superblock.
+// total until write has written the metadata.
 func (w *erofsWriter) entriesWritten() int64 {
 	return max(min(w.done-1, int64(len(w.entries)-2)), 0)
 }

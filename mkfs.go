@@ -22,7 +22,7 @@ import (
 // Files are added via Create, Mkdir, Symlink, and Mknod, then finalized
 // by calling Close which serializes the complete EROFS image.
 type Writer struct {
-	out          io.WriteSeeker
+	out          io.Writer
 	closed       bool
 	blockSize    int    // 0 = unset, resolved to defaultBlockSize in Close
 	buildTime    uint64 // from WithBuildTime or buildTimer
@@ -71,7 +71,10 @@ type CopyOpt func(*Writer)
 
 // Create returns a Writer that produces an EROFS image on Close.
 // Options configure build time, data file, and temp directory.
-func Create(out io.WriteSeeker, opts ...CreateOpt) *Writer {
+//
+// The image is written to out in order, starting at the current position,
+// and only during Close: out does not need to be seekable.
+func Create(out io.Writer, opts ...CreateOpt) *Writer {
 	var o createOptions
 	for _, opt := range opts {
 		opt(&o)
