@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -670,6 +672,154 @@ func TestCreateFSImplicitDirFuncError(t *testing.T) {
 	if err := w.Close(); !errors.Is(err, errLookup) {
 		t.Fatalf("Close = %v, want %v", err, errLookup)
 	}
+}
+
+// implicitFS reports the directories in implicit as implicit through their
+// fs.FileInfo.
+type implicitFS struct {
+	fstest.MapFS
+	implicit map[string]bool
+}
+
+func (f implicitFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	des, err := f.MapFS.ReadDir(name)
+	for i, de := range des {
+		if f.implicit[path.Join(name, de.Name())] {
+			des[i] = implicitDirEntry{de}
+		}
+	}
+	return des, err
+}
+
+func (f implicitFS) Stat(name string) (fs.FileInfo, error) {
+	info, err := f.MapFS.Stat(name)
+	if err == nil && f.implicit[name] {
+		info = implicitDirInfo{info}
+	}
+	return info, err
+}
+
+type implicitDirEntry struct{ fs.DirEntry }
+
+func (e implicitDirEntry) Info() (fs.FileInfo, error) {
+	info, err := e.DirEntry.Info()
+	if err != nil {
+		return nil, err
+	}
+	return implicitDirInfo{info}, nil
+}
+
+type implicitDirInfo struct{ fs.FileInfo }
+
+func (implicitDirInfo) Implicit() bool { return true }
+
+// TestMergeImplicitDir verifies that an implicit directory from CopyFrom keeps
+// an existing directory, and that a missing one is resolved at Close.
+func TestMergeImplicitDir(t *testing.T) {
+	base := fstest.MapFS{
+		".": {Mode: fs.ModeDir | 0o750, Sys: &erofs.Stat{UID: 3, GID: 4, Nlink: 2}},
+		"dir": {
+			Mode: fs.ModeDir | 0o700,
+			Sys:  &erofs.Stat{UID: 1000, GID: 1000, Nlink: 2},
+		},
+		"dir/old.txt": {Data: []byte("old"), Mode: 0o644},
+	}
+	overlay := implicitFS{
+		MapFS: fstest.MapFS{
+			"dir/new.txt":       {Data: []byte("new"), Mode: 0o644},
+			"newdir/file.txt":   {Data: []byte("file"), Mode: 0o644},
+			"lookedup/file.txt": {Data: []byte("file"), Mode: 0o644},
+		},
+		implicit: map[string]bool{".": true, "dir": true, "newdir": true, "lookedup": true},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithImplicitDir(func(name string) (*erofs.Stat, error) {
+		if name == "/lookedup" {
+			return &erofs.Stat{Mode: fs.ModeDir | 0o711, UID: 9, GID: 9}, nil
+		}
+		return nil, nil
+	}))
+	if err := w.CopyFrom(base); err != nil {
+		t.Fatal("CopyFrom base:", err)
+	}
+	if err := w.CopyFrom(overlay, erofs.Merge()); err != nil {
+		t.Fatal("CopyFrom overlay:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckFile(t, efs, "dir/old.txt", "old")
+	erofstest.CheckFile(t, efs, "dir/new.txt", "new")
+	erofstest.CheckFile(t, efs, "newdir/file.txt", "file")
+	checkDirOwner(t, efs, "dir", 0o700, 1000, 1000)
+	checkDirOwner(t, efs, "newdir", 0o750, 3, 4)
+	checkDirOwner(t, efs, "lookedup", 0o711, 9, 9)
+}
+
+// TestMergeImplicitDirStat verifies that a missing implicit directory from
+// CopyFrom keeps the mtime and xattrs of its *erofs.Stat, that its xattrs take
+// precedence over those from the WithImplicitDir function, that the source's
+// xattrs are not modified, and that its link count is computed from the tree.
+func TestMergeImplicitDirStat(t *testing.T) {
+	srcXattrs := map[string]string{"user.k": "src"}
+	src := implicitFS{
+		MapFS: fstest.MapFS{
+			"kept":          {Mode: fs.ModeDir | 0o755, Sys: &erofs.Stat{Mtime: 1000, Nlink: 1, Xattrs: srcXattrs}},
+			"kept/file":     {Data: []byte("file"), Mode: 0o644},
+			"kept/sub/file": {Data: []byte("file"), Mode: 0o644},
+			"lookedup":      {Mode: fs.ModeDir | 0o755, Sys: &erofs.Stat{Mtime: 1000, Xattrs: srcXattrs}},
+			"lookedup/file": {Data: []byte("file"), Mode: 0o644},
+		},
+		implicit: map[string]bool{"kept": true, "lookedup": true},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithImplicitDir(func(name string) (*erofs.Stat, error) {
+		if name == "/lookedup" {
+			return &erofs.Stat{
+				Mode:   fs.ModeDir | 0o711,
+				Xattrs: map[string]string{"user.k": "fn", "user.l": "fn"},
+			}, nil
+		}
+		return nil, nil
+	}))
+	if err := w.CopyFrom(src); err != nil {
+		t.Fatal("CopyFrom:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	if want := map[string]string{"user.k": "src"}; !maps.Equal(srcXattrs, want) {
+		t.Errorf("source xattrs = %v, want %v", srcXattrs, want)
+	}
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+	info, err := fs.Stat(efs, "kept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := info.Sys().(*erofs.Stat)
+	if st.Mtime != 1000 {
+		t.Errorf("kept mtime = %d, want 1000", st.Mtime)
+	}
+	if st.Nlink != 3 {
+		t.Errorf("kept nlink = %d, want 3", st.Nlink)
+	}
+	erofstest.CheckXattrs(t, efs, "kept", map[string]string{"user.k": "src"})
+	checkDirOwner(t, efs, "lookedup", 0o711, 0, 0)
+	erofstest.CheckXattrs(t, efs, "lookedup", map[string]string{"user.k": "src", "user.l": "fn"})
 }
 
 // TestCreateFSSpecialModeBits verifies that setuid, setgid and sticky bits
