@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"math/bits"
 	"os"
 	"path"
@@ -466,6 +467,9 @@ func (fsys *Writer) SetNlink(name string, nlink uint32) error {
 // Opens files for data when Entry.Data is nil.
 // Reads symlink targets via readLinker interface when Entry.LinkTarget is empty.
 // If src implements blockSizer, the image block size is set accordingly.
+// A directory whose fs.FileInfo has an Implicit method returning true is
+// implicit: an existing directory at its path is kept, and a missing one is
+// created and resolved at Close (see WithImplicitDir).
 func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 	if fsys.wErr != nil {
 		return fsys.wErr
@@ -569,6 +573,15 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 				Rdev:    sys.Rdev,
 				Xattrs:  sys.Xattrs,
 				Ino:     uint64(sys.Ino),
+			}
+		}
+
+		if info.IsDir() {
+			if id, ok := info.(implicitDirer); ok && id.Implicit() {
+				if be != nil {
+					info = &entryFileInfo{info: info, sys: be}
+				}
+				return fsys.addImplicitDir(p, info, hardlinks)
 			}
 		}
 
@@ -1099,6 +1112,13 @@ type buildTimer interface {
 // configure the device slot for metadata-only mode.
 type deviceBlocker interface {
 	DeviceBlocks() uint64
+}
+
+// implicitDirer may be implemented by the fs.FileInfo of a directory that a
+// CopyFrom source does not describe itself, such as the parent of an entry in
+// a tar archive without its own entry.
+type implicitDirer interface {
+	Implicit() bool
 }
 
 // readLinker is an interface for filesystems that support reading symlink targets.
@@ -1678,6 +1698,26 @@ func unlinkInode(ino *fsInode) {
 	if ino.nlink > 0 {
 		ino.nlink--
 	}
+}
+
+// addImplicitDir adds an implicit directory from CopyFrom at p. A directory
+// already at p is kept.
+func (fsys *Writer) addImplicitDir(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*fsInode) error {
+	if e, ok := fsys.byPath[p]; ok && e.ino.mode&disk.StatTypeMask == disk.StatTypeDir {
+		return nil
+	}
+	if err := fsys.add(p, info, hardlinks); err != nil {
+		return err
+	}
+	ino := fsys.byPath[p].ino
+	ino.implicit = true
+	// The link count is computed from the tree, as for other implicit
+	// directories.
+	ino.nlink = 0
+	ino.nlinkSet = false
+	// Close merges xattrs into the map, which belongs to the source.
+	ino.xattrs = maps.Clone(ino.xattrs)
+	return nil
 }
 
 // resolveImplicitDir gives an implicit directory its metadata. Its parent
