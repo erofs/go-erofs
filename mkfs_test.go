@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -497,6 +498,216 @@ func TestCreateFSImplicitDirs(t *testing.T) {
 			t.Errorf("%s: not a directory", dir)
 		}
 	}
+}
+
+// writeFile creates name in w with data.
+func writeFile(t *testing.T, w *erofs.Writer, name, data string) {
+	t.Helper()
+	f, err := w.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkDirOwner checks the mode and owner of the directory name.
+func checkDirOwner(t *testing.T, fsys fs.FS, name string, mode fs.FileMode, uid, gid uint32) {
+	t.Helper()
+	info, err := fs.Stat(fsys, name)
+	if err != nil {
+		t.Fatalf("stat %s: %v", name, err)
+	}
+	st := info.Sys().(*erofs.Stat)
+	if info.Mode() != fs.ModeDir|mode || st.UID != uid || st.GID != gid {
+		t.Errorf("%s = %v %d:%d, want %v %d:%d", name, info.Mode(), st.UID, st.GID, fs.ModeDir|mode, uid, gid)
+	}
+}
+
+// TestCreateFSImplicitDirDefault verifies that an implicit directory takes
+// the permission bits and owner of its parent.
+func TestCreateFSImplicitDirDefault(t *testing.T) {
+	var buf testBuffer
+	w := erofs.Create(&buf)
+	if err := w.Mkdir("/", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Chown("/", 1000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, w, "/a/b/file", "a")
+	if err := w.Mkdir("/x", 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Chown("/x", 5, 6); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, w, "/x/y/z/file", "x")
+	// Setting metadata makes a directory explicit.
+	writeFile(t, w, "/p/file", "p")
+	if err := w.Chmod("/p", 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkDirOwner(t, efs, "a", 0o700, 1000, 1000)
+	checkDirOwner(t, efs, "a/b", 0o700, 1000, 1000)
+	checkDirOwner(t, efs, "x/y", 0o750, 5, 6)
+	checkDirOwner(t, efs, "x/y/z", 0o750, 5, 6)
+	checkDirOwner(t, efs, "p", 0o711, 0, 0)
+}
+
+// TestCreateFSImplicitDirFunc verifies that Close resolves implicit
+// directories through WithImplicitDir, parents first.
+func TestCreateFSImplicitDirFunc(t *testing.T) {
+	var calls []string
+	lower := map[string]*erofs.Stat{
+		"/":  {Mode: fs.ModeDir | 0o755, UID: 1, GID: 1},
+		"/a": {Mode: fs.ModeDir | 0o701, UID: 7, GID: 8, Xattrs: map[string]string{"user.k": "lower", "user.l": "lower"}},
+	}
+	fn := func(name string) (*erofs.Stat, error) {
+		calls = append(calls, name)
+		return lower[name], nil
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithImplicitDir(fn))
+	writeFile(t, w, "/a/b/file", "a")
+	if err := w.Setxattr("/a", "user.k", "mine"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	if want := []string{"/", "/a", "/a/b"}; !slices.Equal(calls, want) {
+		t.Errorf("calls = %v, want %v", calls, want)
+	}
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkDirOwner(t, efs, ".", 0o755, 1, 1)
+	checkDirOwner(t, efs, "a", 0o701, 7, 8)
+	// Not found by fn: the default from the resolved parent.
+	checkDirOwner(t, efs, "a/b", 0o701, 7, 8)
+	erofstest.CheckXattrs(t, efs, "a", map[string]string{"user.k": "mine", "user.l": "lower"})
+}
+
+// TestCreateFSImplicitDirFuncError verifies that Close returns an error from
+// the WithImplicitDir function.
+func TestCreateFSImplicitDirFuncError(t *testing.T) {
+	errLookup := errors.New("lookup failed")
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithImplicitDir(func(string) (*erofs.Stat, error) {
+		return nil, errLookup
+	}))
+	writeFile(t, w, "/a/file", "a")
+	if err := w.Close(); !errors.Is(err, errLookup) {
+		t.Fatalf("Close = %v, want %v", err, errLookup)
+	}
+}
+
+// implicitFS reports the directories in implicit as implicit through their
+// fs.FileInfo.
+type implicitFS struct {
+	fstest.MapFS
+	implicit map[string]bool
+}
+
+func (f implicitFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	des, err := f.MapFS.ReadDir(name)
+	for i, de := range des {
+		if f.implicit[path.Join(name, de.Name())] {
+			des[i] = implicitDirEntry{de}
+		}
+	}
+	return des, err
+}
+
+func (f implicitFS) Stat(name string) (fs.FileInfo, error) {
+	info, err := f.MapFS.Stat(name)
+	if err == nil && f.implicit[name] {
+		info = implicitDirInfo{info}
+	}
+	return info, err
+}
+
+type implicitDirEntry struct{ fs.DirEntry }
+
+func (e implicitDirEntry) Info() (fs.FileInfo, error) {
+	info, err := e.DirEntry.Info()
+	if err != nil {
+		return nil, err
+	}
+	return implicitDirInfo{info}, nil
+}
+
+type implicitDirInfo struct{ fs.FileInfo }
+
+func (implicitDirInfo) Implicit() bool { return true }
+
+// TestMergeImplicitDir verifies that an implicit directory from CopyFrom keeps
+// an existing directory, and that a missing one is resolved at Close.
+func TestMergeImplicitDir(t *testing.T) {
+	base := fstest.MapFS{
+		".": {Mode: fs.ModeDir | 0o750, Sys: &erofs.Stat{UID: 3, GID: 4, Nlink: 2}},
+		"dir": {
+			Mode: fs.ModeDir | 0o700,
+			Sys:  &erofs.Stat{UID: 1000, GID: 1000, Nlink: 2},
+		},
+		"dir/old.txt": {Data: []byte("old"), Mode: 0o644},
+	}
+	overlay := implicitFS{
+		MapFS: fstest.MapFS{
+			"dir/new.txt":       {Data: []byte("new"), Mode: 0o644},
+			"newdir/file.txt":   {Data: []byte("file"), Mode: 0o644},
+			"lookedup/file.txt": {Data: []byte("file"), Mode: 0o644},
+		},
+		implicit: map[string]bool{".": true, "dir": true, "newdir": true, "lookedup": true},
+	}
+
+	var buf testBuffer
+	w := erofs.Create(&buf, erofs.WithImplicitDir(func(name string) (*erofs.Stat, error) {
+		if name == "/lookedup" {
+			return &erofs.Stat{Mode: fs.ModeDir | 0o711, UID: 9, GID: 9}, nil
+		}
+		return nil, nil
+	}))
+	if err := w.CopyFrom(base); err != nil {
+		t.Fatal("CopyFrom base:", err)
+	}
+	if err := w.CopyFrom(overlay, erofs.Merge()); err != nil {
+		t.Fatal("CopyFrom overlay:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	erofstest.FsckErofsBytes(t, buf.Bytes())
+	efs, err := erofs.Open(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal("Open:", err)
+	}
+
+	erofstest.CheckFile(t, efs, "dir/old.txt", "old")
+	erofstest.CheckFile(t, efs, "dir/new.txt", "new")
+	erofstest.CheckFile(t, efs, "newdir/file.txt", "file")
+	checkDirOwner(t, efs, "dir", 0o700, 1000, 1000)
+	checkDirOwner(t, efs, "newdir", 0o750, 3, 4)
+	checkDirOwner(t, efs, "lookedup", 0o711, 9, 9)
 }
 
 // TestCreateFSSpecialModeBits verifies that setuid, setgid and sticky bits

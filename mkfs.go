@@ -45,8 +45,9 @@ type Writer struct {
 	spoolOff     int64    // current byte offset in spool
 	tempDir      string   // from WithTempDir
 	noInlineData bool     // from WithNoInlineData
-	cpBuf        []byte   // shared buffer for io.Copy into File
-	padBuf       []byte   // shared zero buffer for padding (block-sized, lazy)
+	implicitDir  ImplicitDirFunc
+	cpBuf        []byte // shared buffer for io.Copy into File
+	padBuf       []byte // shared zero buffer for padding (block-sized, lazy)
 
 	progress progressCounters // see Writer.Progress
 }
@@ -82,7 +83,7 @@ func Create(out io.Writer, opts ...CreateOpt) *Writer {
 
 	root := &fsEntry{
 		path: "/",
-		ino:  &fsInode{mode: disk.StatTypeDir | 0o755},
+		ino:  &fsInode{mode: disk.StatTypeDir | 0o755, implicit: true},
 	}
 	fsys := &Writer{
 		out:          out,
@@ -94,6 +95,7 @@ func Create(out io.Writer, opts ...CreateOpt) *Writer {
 		dataFile:     o.dataFile,
 		tempDir:      o.tempDir,
 		noInlineData: o.noInlineData,
+		implicitDir:  o.implicitDir,
 	}
 
 	if o.blockSize != 0 {
@@ -188,6 +190,28 @@ func WithTempDir(dir string) CreateOpt {
 func WithNoInlineData() CreateOpt {
 	return func(o *createOptions) {
 		o.noInlineData = true
+	}
+}
+
+// ImplicitDirFunc returns the metadata of an implicit directory: a directory
+// the Writer created as the parent of another entry and that was not given
+// metadata of its own. name is the directory's absolute path. Its mode, owner,
+// mtime and xattrs are used. Xattrs the directory already has are kept.
+//
+// The xattrs are copied as returned. A function returning a directory from a
+// lower overlayfs layer must leave out the overlayfs xattrs, such as
+// trusted.overlay.opaque: copied to an upper layer, an opaque xattr hides the
+// lower layer's contents of the directory.
+//
+// A nil Stat leaves the directory with the default: the permission bits and
+// owner of its parent directory, or mode 0755 owned by 0:0 for the root.
+type ImplicitDirFunc func(name string) (*Stat, error)
+
+// WithImplicitDir sets the function Close calls for each implicit directory,
+// parents before their children. An error from fn is returned by Close.
+func WithImplicitDir(fn ImplicitDirFunc) CreateOpt {
+	return func(o *createOptions) {
+		o.implicitDir = fn
 	}
 }
 
@@ -290,6 +314,7 @@ func (fsys *Writer) Mkdir(name string, perm fs.FileMode) error {
 	name = cleanPath(name)
 	if name == "/" {
 		fsys.root.ino.mode = dirMode
+		fsys.root.ino.implicit = false
 		return nil
 	}
 	if err := fsys.checkPath(name); err != nil {
@@ -369,6 +394,7 @@ func (fsys *Writer) Chmod(name string, mode fs.FileMode) error {
 	}
 	perm := goModeToUnixMode(mode) & 0o7777
 	e.ino.mode = (e.ino.mode & disk.StatTypeMask) | perm
+	e.ino.implicit = false
 	return nil
 }
 
@@ -383,6 +409,7 @@ func (fsys *Writer) Chown(name string, uid, gid int) error {
 	}
 	e.ino.uid = uint32(uid)
 	e.ino.gid = uint32(gid)
+	e.ino.implicit = false
 	return nil
 }
 
@@ -439,6 +466,9 @@ func (fsys *Writer) SetNlink(name string, nlink uint32) error {
 // Opens files for data when Entry.Data is nil.
 // Reads symlink targets via readLinker interface when Entry.LinkTarget is empty.
 // If src implements blockSizer, the image block size is set accordingly.
+// A directory whose fs.FileInfo has an Implicit method returning true is
+// implicit: an existing directory at its path is kept, and a missing one is
+// created and resolved at Close (see WithImplicitDir).
 func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 	if fsys.wErr != nil {
 		return fsys.wErr
@@ -520,6 +550,12 @@ func (fsys *Writer) CopyFrom(src fs.FS, opts ...CopyOpt) error {
 					fsys.remove(target)
 				}
 				return nil
+			}
+		}
+
+		if info.IsDir() {
+			if id, ok := info.(implicitDirer); ok && id.Implicit() {
+				return fsys.addImplicitDir(p, info, hardlinks)
 			}
 		}
 
@@ -675,7 +711,10 @@ func (fsys *Writer) Close() error {
 	if !fsys.hasBuildTime {
 		policy = newMostCommonMtime()
 	}
-	root := fsys.buildErofsTree(policy)
+	root, err := fsys.buildErofsTree(policy)
+	if err != nil {
+		return err
+	}
 
 	buildTime, buildTimeNs := fsys.buildTime, fsys.buildTimeNs
 	if policy != nil {
@@ -1012,6 +1051,7 @@ type fsInode struct {
 	contiguous   bool // data blocks are contiguous; use large chunk size
 	fileClosed   bool // true after File.Close()
 	metadataOnly bool // chunk-based layout even when chunks is nil
+	implicit     bool // directory created as a parent; resolved at Close
 }
 
 // fsEntry is the directory-entry view of a file. It carries only the path
@@ -1046,6 +1086,7 @@ type createOptions struct {
 	dataFile     *os.File // external data file for metadata-only mode
 	tempDir      string   // temp directory for spool file
 	noInlineData bool     // disable tail-packing for regular files
+	implicitDir  ImplicitDirFunc
 }
 
 // blockSizer may be implemented by an fs.FS to declare its block size.
@@ -1066,6 +1107,13 @@ type buildTimer interface {
 // configure the device slot for metadata-only mode.
 type deviceBlocker interface {
 	DeviceBlocks() uint64
+}
+
+// implicitDirer may be implemented by the fs.FileInfo of a directory that a
+// CopyFrom source does not describe itself, such as the parent of an entry in
+// a tar archive without its own entry.
+type implicitDirer interface {
+	Implicit() bool
 }
 
 // readLinker is an interface for filesystems that support reading symlink targets.
@@ -1410,6 +1458,7 @@ func (fsys *Writer) add(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*f
 
 	if p == "/" {
 		ino := fsys.root.ino
+		ino.implicit = false
 		ino.mode = mode
 		ino.uid = be.UID
 		ino.gid = be.GID
@@ -1557,7 +1606,7 @@ func (fsys *Writer) ensureParent(name string) {
 		d := missing[i]
 		e := &fsEntry{
 			path: d,
-			ino:  &fsInode{mode: disk.StatTypeDir | 0o755},
+			ino:  &fsInode{mode: disk.StatTypeDir | 0o755, implicit: true},
 		}
 		fsys.addChild(e)
 	}
@@ -1646,11 +1695,62 @@ func unlinkInode(ino *fsInode) {
 	}
 }
 
+// addImplicitDir adds an implicit directory from CopyFrom at p. A directory
+// already at p is kept.
+func (fsys *Writer) addImplicitDir(p string, info fs.FileInfo, hardlinks map[hardlinkKey]*fsInode) error {
+	if e, ok := fsys.byPath[p]; ok && e.ino.mode&disk.StatTypeMask == disk.StatTypeDir {
+		return nil
+	}
+	if err := fsys.add(p, info, hardlinks); err != nil {
+		return err
+	}
+	fsys.byPath[p].ino.implicit = true
+	return nil
+}
+
+// resolveImplicitDir gives an implicit directory its metadata. Its parent
+// must already be resolved, as the directory may default to the parent's
+// permission bits and owner.
+func (fsys *Writer) resolveImplicitDir(e *fsEntry) error {
+	ino := e.ino
+	ino.implicit = false
+	if fsys.implicitDir != nil {
+		st, err := fsys.implicitDir(e.path)
+		if err != nil {
+			return fmt.Errorf("mkfs: implicit directory %s: %w", e.path, err)
+		}
+		if st != nil {
+			ino.mode = disk.StatTypeDir | goModeToUnixMode(st.Mode)&0o7777
+			ino.uid = st.UID
+			ino.gid = st.GID
+			ino.mtime = st.Mtime
+			ino.mtimeNs = st.MtimeNs
+			for k, v := range st.Xattrs {
+				if _, ok := ino.xattrs[k]; ok {
+					continue
+				}
+				if ino.xattrs == nil {
+					ino.xattrs = make(map[string]string, len(st.Xattrs))
+				}
+				ino.xattrs[k] = v
+			}
+			return nil
+		}
+	}
+	if e.parent != nil {
+		ino.mode = disk.StatTypeDir | e.parent.ino.mode&0o7777
+		ino.uid = e.parent.ino.uid
+		ino.gid = e.parent.ino.gid
+	}
+	return nil
+}
+
 // buildErofsTree converts the fsEntry tree into an erofsEntry tree via BFS.
 // Children are sorted for deterministic output. The Writer is consumed.
 // If policy is non-nil, it observes the mtime of each inode written, once
-// per inode.
-func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
+// per inode. An implicit directory is resolved before it is converted, after
+// its parent.
+func (fsys *Writer) buildErofsTree(policy mtimePolicy) (*erofsEntry, error) {
 	countMtime := func(e *erofsEntry) {
 		if policy != nil && e.hardLinkPrimary == nil {
 			policy.observe(e.mtime, e.mtimeNs)
@@ -1668,6 +1768,11 @@ func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 	// back via hardLinkPrimary and borrow its NID.
 	seen := make(map[*fsInode]*erofsEntry)
 
+	if fsys.root.ino.implicit {
+		if err := fsys.resolveImplicitDir(fsys.root); err != nil {
+			return nil, err
+		}
+	}
 	rootEr := fsys.fsToErofs(fsys.root)
 	countMtime(rootEr)
 	queue := []pair{{fsys.root, rootEr}}
@@ -1687,6 +1792,12 @@ func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 		for _, c := range cur.fs.children {
 			if c.removed {
 				continue
+			}
+			// The parent was resolved when it was converted.
+			if c.ino.implicit {
+				if err := fsys.resolveImplicitDir(c); err != nil {
+					return nil, err
+				}
 			}
 			ent := fsys.fsToErofs(c)
 
@@ -1713,7 +1824,7 @@ func (fsys *Writer) buildErofsTree(policy mtimePolicy) *erofsEntry {
 			return cur.er.children[i].name < cur.er.children[j].name
 		})
 	}
-	return rootEr
+	return rootEr, nil
 }
 
 // fsToErofs converts an fsEntry to an erofsEntry.
