@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  EROFS_UTILS_VERSION: v1.9.1
+  EROFS_UTILS_REF: 7e52cbffa83fbe9eb10bbf110cb12d503a048081
 
 jobs:
   lint:
@@ -53,11 +53,8 @@ jobs:
 
       - name: Build and install erofs-utils
         run: |
-          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz | tar -xzf -
-          cd erofs-utils-${EROFS_UTILS_VERSION#v}
-          for p in "${GITHUB_WORKSPACE}"/.github/workflows/patches/erofs-utils/*.patch; do
-            patch -p1 < "$p"
-          done
+          curl -L https://github.com/erofs/erofs-utils/archive/${EROFS_UTILS_REF}.tar.gz | tar -xzf -
+          cd erofs-utils-${EROFS_UTILS_REF}
           ./autogen.sh
           ./configure --enable-lz4
           make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
@@ -87,11 +84,8 @@ jobs:
 
       - name: Build and install erofs-utils
         run: |
-          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz | tar -xzf -
-          cd erofs-utils-${EROFS_UTILS_VERSION#v}
-          for p in "${GITHUB_WORKSPACE}"/.github/workflows/patches/erofs-utils/*.patch; do
-            patch -p1 < "$p"
-          done
+          curl -L https://github.com/erofs/erofs-utils/archive/${EROFS_UTILS_REF}.tar.gz | tar -xzf -
+          cd erofs-utils-${EROFS_UTILS_REF}
           ./autogen.sh
           ./configure --enable-lz4
           make -j"$(nproc)"
@@ -116,76 +110,16 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install MinGW-w64 toolchain
+      - name: Cross-compile mkfs.erofs for Windows
         run: |
-          sudo apt-get update
-          sudo apt-get install -y autoconf automake libtool pkg-config mingw-w64
-
-      - name: Cross-compile lz4 for Windows
-        env:
-          MINGW_HOST: x86_64-w64-mingw32
-        run: |
-          curl -L https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz | tar -xzf -
-          cd lz4-1.10.0/lib
-          make -j"$(nproc)" \
-            CC=${MINGW_HOST}-gcc \
-            AR=${MINGW_HOST}-ar \
-            WINDRES=${MINGW_HOST}-windres \
-            TARGET_OS=Windows \
-            BUILD_STATIC=yes \
-            BUILD_SHARED=no \
-            CFLAGS="-O3 -DXXH_NAMESPACE=LZ4_"
-          sudo make PREFIX=/usr/${MINGW_HOST} install
-
-      - name: Cross-compile erofs-utils for Windows
-        env:
-          MINGW_HOST: x86_64-w64-mingw32
-        run: |
-          curl -L https://github.com/erofs/erofs-utils/archive/refs/tags/${EROFS_UTILS_VERSION}.tar.gz | tar -xzf -
-          cd erofs-utils-${EROFS_UTILS_VERSION#v}
-
-          # Install compat headers for MinGW
-          sudo cp -r "${GITHUB_WORKSPACE}/.github/workflows/mingw-compat-headers"/* /usr/${MINGW_HOST}/include/
-
-          # Apply Windows compatibility patches
-          for p in "${GITHUB_WORKSPACE}"/.github/workflows/patches/erofs-utils/*.patch; do
-            patch -p1 < "$p"
-          done
-
-          ./autogen.sh
-          # PKG_CONFIG_LIBDIR replaces the default search path, so
-          # configure cannot pick up the build host's libraries.
-          PKG_CONFIG_LIBDIR=/usr/${MINGW_HOST}/lib/pkgconfig \
-          ./configure \
-            --host=${MINGW_HOST} \
-            --disable-shared \
-            --enable-lz4 \
-            --without-zlib \
-            --disable-lzma \
-            --without-libzstd \
-            --without-selinux \
-            --without-uuid \
-            --without-openssl \
-            --without-libxml2 \
-            --without-xxhash \
-            --without-libcurl \
-            --without-json-c \
-            --disable-fuse \
-            --disable-debug \
-            --disable-dependency-tracking \
-            CFLAGS="-O2 -g -D_FILE_OFFSET_BITS=64" \
-            LDFLAGS="-Wl,-Bstatic -static-libgcc -L/usr/${MINGW_HOST}/lib" \
-            liblz4_LIBS="/usr/${MINGW_HOST}/lib/liblz4.a"
-
-          make -j"$(nproc)" -C lib CPPFLAGS="-include posix_compat.h"
-          make -j"$(nproc)" -C mkfs CPPFLAGS="-include posix_compat.h" LIBS="-llz4"
-
-          ${MINGW_HOST}-strip mkfs/mkfs.erofs.exe
+          curl -fL https://github.com/erofs/erofs-utils/archive/${EROFS_UTILS_REF}.tar.gz | tar -xzf -
+          cd erofs-utils-${EROFS_UTILS_REF}
+          docker build --target windows --output type=local,dest=../erofs-utils-win-amd64 .
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: mkfs-erofs-windows
-          path: erofs-utils-*/mkfs/mkfs.erofs.exe
+          path: erofs-utils-win-amd64/bin/mkfs.erofs.exe
 
   test-windows:
     name: Build & Test (windows-latest)
@@ -206,7 +140,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\bin"
-          Copy-Item erofs-utils-*/mkfs/mkfs.erofs.exe "$env:USERPROFILE\bin\"
+          Copy-Item mkfs.erofs.exe "$env:USERPROFILE\bin\"
           "$env:USERPROFILE\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Verify mkfs.erofs
