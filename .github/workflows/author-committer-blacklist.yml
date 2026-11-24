@@ -1,0 +1,74 @@
+name: Author and committer blacklist
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check author and committer blacklist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Reject blacklisted authors and committers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          def git(*args):
+              return subprocess.check_output(
+                  ["git", *args], text=True, encoding="utf-8", errors="replace"
+              )
+
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          revision = f"{base}..{head}" if base and set(base) != {"0"} else head
+          commits = git("rev-list", revision).splitlines()
+          rejected = False
+          for sha in commits:
+              fields = git(
+                  "show", "-s",
+                  "--format=%ae%x00%ce%x00%B",
+                  sha,
+              ).rstrip("\n").split("\0", 2)
+              identities = zip(
+                  ("author email", "committer email"),
+                  fields[:2],
+              )
+              for role, identity in identities:
+                  normalized = identity.casefold()
+                  if normalized == "noreply@anthropic.com":
+                      print(f"::error::Commit {sha} identifies Claude as {role}; please remove that.")
+                      rejected = True
+                  if normalized.endswith("@users.noreply.github.com"):
+                      print(f"::error::Commit {sha} uses a GitHub private {role}; please use a public email address.")
+                      rejected = True
+              for email in re.findall(
+                  r"^Co-Authored-By:[^\r\n]*<([^<>\s]+)>",
+                  fields[2], re.IGNORECASE | re.MULTILINE,
+              ):
+                  normalized = email.casefold()
+                  if normalized == "noreply@anthropic.com":
+                      print(f"::error::Commit {sha} identifies Claude as co-author; please remove that.")
+                      rejected = True
+                  if normalized.endswith("@users.noreply.github.com"):
+                      print(f"::error::Commit {sha} uses a GitHub private co-author email; please use a public email address.")
+                      rejected = True
+          print(f"Checked {len(commits)} commit(s).")
+          sys.exit(1 if rejected else 0)
+          PY
