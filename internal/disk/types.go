@@ -5,12 +5,15 @@ const (
 	SuperBlockOffset = 1024
 
 	FeatureIncompatLZ4_0Padding         = 0x1
+	FeatureIncompatComprCfgs            = 0x2
 	FeatureIncompatChunkedFile          = 0x4
 	FeatureIncompatDeviceTable          = 0x8
+	FeatureIncompatZtailpacking         = 0x10
 	FeatureIncompatFragments            = 0x20
 	FeatureIncompatXattrPrefixes        = 0x40
 	FeatureIncompatAll           uint32 = FeatureIncompatLZ4_0Padding |
-		FeatureIncompatChunkedFile | FeatureIncompatDeviceTable |
+		FeatureIncompatComprCfgs | FeatureIncompatChunkedFile |
+		FeatureIncompatDeviceTable | FeatureIncompatZtailpacking |
 		FeatureIncompatFragments | FeatureIncompatXattrPrefixes
 
 	SizeSuperBlock      = 128
@@ -31,6 +34,13 @@ const (
 	LayoutChunkFormatBits    = 0x001F
 	LayoutChunkFormatIndexes = 0x0020
 	LayoutChunkFormat48Bit   = 0x0040
+
+	// Compression algorithm IDs stored in the low/high nibbles of a
+	// compressed inode's z_erofs_map_header h_algorithmtype byte.
+	CompressionLZ4     = 0
+	CompressionLZMA    = 1
+	CompressionDeflate = 2
+	CompressionZstd    = 3
 )
 
 // SuperBlock represents the EROFS on-disk superblock.
